@@ -10,7 +10,18 @@ import { createNovelAIMcpServer, TOOL_COUNT } from '../dist/mcp-tools.js';
 import { DEFAULT_MODEL, IMAGE_MODELS } from '../dist/types.js';
 import { VibeCache } from '../dist/vibe-cache.js';
 
-const names = ['generate_image', 'img2img', 'inpaint_image', 'augment_image', 'upscale_image', 'encode_vibe', 'suggest_tags', 'get_subscription', 'get_nai_prompt'];
+const descriptions = {
+  generate_image: '按提示词纯文生图',
+  img2img: '基于源图按提示词重绘整张图，strength默认0.7',
+  inpaint_image: '绘源图指定区域，需提供mask_image（黑留白改）或mask_regions，局部重绘不支持vibe_references',
+  augment_image: '导演图像处理工具，对源图执行抽线稿、素描、上色、画面清理、改表情、去背景（返回多图）或像素对齐',
+  upscale_image: '对源图进行4倍超分辨率放大；默认自动将超过1MP的输入等比缩小到上限内再放大',
+  encode_vibe: '为V4.5模型预编码一张风格参考图，返回可复用的vibe_id（仅限相同模型用于generate_image或img2img，不可用于局部重绘或下载原图）',
+  suggest_tags: '按提示词片段查询NovelAI标签补全建议，支持英语（en）和日语（jp），返回标签JSON',
+  get_subscription: '查询当前个人API Key的账户余额与用量',
+  get_nai_prompt: '获取NovelAI提示词写作模板与格式规范。首次调用generate_image前必须先调用本工具',
+};
+const names = Object.keys(descriptions);
 const v45 = 'nai-diffusion-4-5-full';
 const freeOnly = '当前为免费体验模式，仅支持文生图（generate_image）与提示词模板（get_nai_prompt）。请在请求头配置 Authorization: Bearer <您的API_KEY> 解锁全部功能。';
 const imageOrigin = new URL('https://images.example.invalid/gateway/novelai');
@@ -89,6 +100,7 @@ for (const mode of ['paid', 'free']) {
     assert.equal(DEFAULT_MODEL, 'nai-diffusion-5-full');
     assert.deepEqual([...IMAGE_MODELS].sort(), [DEFAULT_MODEL, 'nai-diffusion-5-curated', v45, 'nai-diffusion-4-5-curated'].sort());
     for (const definition of tools) {
+      assert.equal(definition.description, descriptions[definition.name], definition.name);
       assert.equal(definition.inputSchema.additionalProperties, false, definition.name);
       if (names.slice(0, 3).includes(definition.name)) {
         const fields = definition.inputSchema.properties;
@@ -96,11 +108,9 @@ for (const mode of ['paid', 'free']) {
         assert.deepEqual(fields.model.enum, [...IMAGE_MODELS]);
         assert.equal(fields.n_samples.const, 1);
         assert.equal(fields.n_samples.default, 1);
-        assert.match(definition.description, /首次.*先调用 get_nai_prompt/);
       }
     }
     const prompt = tools.find(x => x.name === 'get_nai_prompt');
-    assert.match(prompt.description, /首次.*generate_image.*img2img.*inpaint_image.*先调用/);
     assert.equal(prompt.annotations.readOnlyHint, true);
     assert.equal(prompt.annotations.openWorldHint, false);
     const template = await readFile(promptFile, 'utf8');
@@ -119,7 +129,6 @@ for (const mode of ['paid', 'free']) {
       }
     } else {
       assert.equal(tools.find(x => x.name === 'inpaint_image').inputSchema.properties.vibe_references, undefined);
-      assert.match(tools.find(x => x.name === 'get_subscription').description, /当前 API Key.*账户余额与用量信息.*\/v1\/usage/);
       rejected(await call('unknown'), /未知工具/);
     }
     assert.deepEqual(api.calls, []);

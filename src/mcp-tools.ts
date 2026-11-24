@@ -117,20 +117,20 @@ function tool(name: string, description: string, properties: Properties, require
   };
 }
 
-const generateDescription = `按提示词生成图片，默认使用 V5 Full。${PROMPT_HINT}${IMAGE_RECEIPT}`;
-const promptTool = tool('get_nai_prompt', PROMPT_HINT, {}, [], true, false);
+const generateDescription = '按提示词纯文生图';
+const promptTool = tool('get_nai_prompt', '获取NovelAI提示词写作模板与格式规范。首次调用generate_image前必须先调用本工具', {}, [], true, false);
 const paidTools = [
   tool('generate_image', generateDescription, {
     ...generationFields, character_references: preciseField, ...vibeFields,
     width: { ...dimension('输出宽度（像素），对齐到 64 的倍数。'), default: DEFAULT_WIDTH },
     height: { ...dimension('输出高度（像素），对齐到 64 的倍数。'), default: DEFAULT_HEIGHT },
   }, ['base_prompt']),
-  tool('img2img', `用提示词重绘源图，strength 越大改动越多。${PROMPT_HINT}${IMAGE_RECEIPT}`, {
+  tool('img2img', '基于源图按提示词重绘整张图，strength默认0.7', {
     ...sourceFields, ...vibeFields, strength: unit('去噪强度，默认 0.7。'),
     color_correct: flag('校正颜色以贴近原图，默认开启。'),
     extra_noise_seed: bounded('integer', '额外噪声种子，默认沿用出图种子。', 1, MAX_SEED),
   }, ['base_prompt', 'source_image']),
-  tool('inpaint_image', `重绘源图指定区域。提供 mask_image 或 mask_regions；不接受 vibe_references。${PROMPT_HINT}${IMAGE_RECEIPT}`, {
+  tool('inpaint_image', '绘源图指定区域，需提供mask_image（黑留白改）或mask_regions，局部重绘不支持vibe_references', {
     ...sourceFields,
     mask_image: nonempty(`黑色保留，白色重绘。与 mask_regions 同时提供时优先使用此遮罩。${IMAGE_INPUT}`),
     mask_regions: {
@@ -142,28 +142,28 @@ const paidTools = [
     },
     inpaint_strength: unit('遮罩内重绘强度，默认 1。'), add_original_image: flag('用原图合成遮罩外区域，默认开启。'),
   }, ['base_prompt', 'source_image']),
-  tool('augment_image', `对源图抽线稿、转素描、着色、清理画面、改变表情、移除背景或调整像素。${IMAGE_RECEIPT}`, {
+  tool('augment_image', '导演图像处理工具，对源图执行抽线稿、素描、上色、画面清理、改表情、去背景（返回多图）或像素对齐', {
     source_image: nonempty(IMAGE_INPUT), req_type: choice('图像处理方式。', AUGMENT_REQ_TYPES),
     emotion: choice('表情名称，req_type 为 emotion 时必须提供。', EMOTION_MOODS),
     prompt: text('补充提示词。'), defry: bounded('integer', '着色降噪或表情减弱程度，只用于 colorize 和 emotion。', 0, 5),
     width: dimension('处理宽度，默认沿用源图。'), height: dimension('处理高度，默认沿用源图。'),
   }, ['source_image', 'req_type']),
-  tool('upscale_image', `4 倍超分辨率放大图片。默认先将超过 1,048,576 像素的输入等比缩小。${IMAGE_RECEIPT}`, {
+  tool('upscale_image', '对源图进行4倍超分辨率放大；默认自动将超过1MP的输入等比缩小到上限内再放大', {
     source_image: nonempty(IMAGE_INPUT), model: { ...nonempty('放大使用的上游模型标识。'), default: DEFAULT_UPSCALE_MODEL },
     declared_blur_sigma: { type: 'number', minimum: 0, description: '显式声明的源图模糊程度。' },
     auto_fit_1mp: { ...flag('自动等比缩小过大的输入图。'), default: true },
   }, ['source_image']),
-  tool('encode_vibe', '为 V4.5 编码风格参考，同一模型的后续生图或图生图可用 vibe_id 复用。', {
+  tool('encode_vibe', '为V4.5模型预编码一张风格参考图，返回可复用的vibe_id（仅限相同模型用于generate_image或img2img，不可用于局部重绘或下载原图）', {
     source_image: nonempty(IMAGE_INPUT), model: { ...choice('编码模型，默认 V4.5 Full。', ENCODE_VIBE_MODELS), default: DEFAULT_REFERENCE_MODEL },
     information_extracted: { ...unit('信息提取比例。'), default: 1 }, mask_image: nonempty(`可选参考遮罩。${IMAGE_INPUT}`),
     crop_to_mask: flag('编码时裁剪到遮罩区域，启用时必须提供 mask_image。'),
     include_raw_base64: { ...flag('同时返回原始 Base64 编码。'), default: false },
   }, ['source_image']),
-  tool('suggest_tags', '按提示词片段查询 NovelAI 标签建议，返回标签 JSON。', {
+  tool('suggest_tags', '按提示词片段查询NovelAI标签补全建议，支持英语（en）和日语（jp），返回标签JSON', {
     prompt: nonempty('需要补全的提示词片段。'), model: modelField,
     lang: { ...choice('标签语言。', ['en', 'jp']), default: 'en' }, limit: { ...bounded('integer', '最多返回的标签数。', 1, 100), default: 20 },
   }, ['prompt'], true),
-  tool('get_subscription', '查询当前 API Key 在中转站的账户余额与用量信息（调用 /v1/usage），返回中文摘要与完整的上游 JSON。', {}, [], true),
+  tool('get_subscription', '查询当前个人API Key的账户余额与用量', {}, [], true),
   promptTool,
 ];
 export const TOOL_COUNT = paidTools.length;
@@ -173,7 +173,7 @@ const freeSize = (label: string, value: number) => ({
   multipleOf: 64, default: value,
 });
 const freeTools = [
-  tool('generate_image', `${generateDescription}免费体验仅限纯文生图，宽高须为 64 的倍数，总像素不超过 1,048,576，至多 28 步。`, {
+  tool('generate_image', generateDescription, {
     ...generationFields, width: freeSize('宽度', DEFAULT_WIDTH), height: freeSize('高度', DEFAULT_HEIGHT),
     steps: bounded('integer', '采样步数，免费体验最多 28 步。', 1, MAX_FREE_STEPS),
   }, ['base_prompt']),
