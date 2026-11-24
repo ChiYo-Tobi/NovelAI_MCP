@@ -1,0 +1,18 @@
+	# Inside the API site's HTTPS block, before its catch-all handle.
+	handle_path /mcp/* {
+		request_body {
+			max_size 50MiB
+		}
+		reverse_proxy novelai-mcp:3000 {
+			flush_interval -1
+			header_up X-Real-IP {remote_host}
+			# Caddy preserves Host, Authorization (including absence) and the MCP headers,
+			# and sets the standard X-Forwarded-* headers itself.
+			transport http {
+				versions 1.1
+				response_header_timeout 600s
+				read_timeout 600s
+				write_timeout 600s
+			}
+		}
+	}

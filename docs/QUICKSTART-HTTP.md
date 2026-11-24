@@ -1,232 +1,109 @@
-# 快速开始 - HTTP SSE 模式
+# 运行手册：单实例 Streamable HTTP
 
-5分钟内启动并测试 NovelAI MCP HTTP 服务器。
+仅连接托管服务请看 [README 中的客户端配置](../README.md)。本页供运行服务和反向代理的人使用。
 
-## 第一步：安装依赖
+## 1. 复用已有私有网络
 
-```bash
-npm install
+在项目根目录准备 Docker Engine 和 Compose v2。上游应用应当已经在一个用户定义的私有网络中，且 `qiandaiapi-app` 是该网络上可解析的名称或别名。可通过仅显示网络名的命令核对（容器名按实际替换）：
+
+```sh
+docker inspect --format '{{range $name, $_ := .NetworkSettings.Networks}}{{println $name}}{{end}}' qiandaiapi-app
 ```
 
-## 第二步：设置 API Key 和代理（可选）
+把 `.env.example` 复制为本服务专用的 `.env`（POSIX：`cp .env.example .env`；PowerShell：`Copy-Item .env.example .env`），**仅首次配置时复制**。在受信任的编辑器里填值，不要把真实凭据写进命令行。限制 `.env` 的读取权限（POSIX 用 `chmod 600 .env`；Windows 用文件 ACL）。不要在该文件放其他服务的凭据，Compose 的 `env_file` 会将它注入此容器。
 
-**Linux/Mac:**
-```bash
-export NOVELAI_API_KEY="your-api-key-here"
-export HTTPS_PROXY="http://127.0.0.1:7890"  # 可选：如果需要代理
+| 配置名 | Compose 值或设置方法 |
+|---|---|
+| `MCP_DOCKER_NETWORK` | 必填：上述已有网络的**精确名称**。Compose 引用 external network，不会新建或接管它 |
+| `DEFAULT_NOVELAI_API_KEY` | 必填：服务端用于匿名体验的默认密钥，仅在部署机 `.env` 注入。个人客户端发送自己的 `USER_API_KEY` |
+| `UPSTREAM_BASE_URL` | `http://qiandaiapi-app:8080`，是私网服务基址，不是公网 MCP 地址 |
+| `MCP_BIND_HOST` / `PORT` | 容器固定为 `0.0.0.0` / `3000`，这样同网反代和容器内健康检查都能访问 |
+| `MCP_HOST_PORT` | 默认 `13000`；只发布 `127.0.0.1:${MCP_HOST_PORT:-13000}:3000`。反代也在同一私网时可移除整个 `ports` 段 |
+| `MCP_IMAGE_PUBLIC_BASE_URL` | `https://api.chiyotobi.party/mcp`，用客户端可达的 HTTPS 基址，保留外层路径前缀，不含查询、凭据或第二个 `/mcp` |
+| `MCP_IMAGE_TTL_SECONDS` | `300`；过期的图和 ID 不再提供，不能靠重启或备份延长下载链接 |
+| `MCP_ALLOWED_ORIGINS` | `*`；如需限制，可换成逗号分隔的完整源（例如 `https://api.chiyotobi.party`，不带路径）。这只是 Origin 策略，不是鉴权 |
+| `MCP_DATA_DIR` | `/var/lib/novelai-mcp/data`，命名卷 `novelai-mcp-data` 保存免费额度及 Vibe 缓存 |
+| `MCP_IMAGE_ARCHIVE_DIR` | `/var/lib/novelai-mcp/images`，命名卷 `novelai-mcp-images` 保存限时原图及元数据 |
+| `MCP_IMAGE_TAG` | 本地构建标签，默认 `local`；生产为每个版本设一个唯一标签，保留上一个健康版本，不覆盖它 |
+
+只需把本服务接入该网络，不要停掉或重建上游、反代或外部网络。两个挂载点必须彼此独立、不能互相包含；不要挂在 `/` 或项目根上，也不要把他人数据放入图片清理目录。**一个账本只允许一个服务进程写入**，不使用扩容、集群或多 worker。
+
+## 2. 构建与内部验收
+
+```sh
+docker compose config --quiet
+docker compose build novelai-mcp
+docker compose up -d --no-build --wait novelai-mcp
+docker compose ps novelai-mcp
+curl -fsS http://127.0.0.1:13000/health
 ```
 
-**Windows PowerShell:**
-```powershell
-$env:NOVELAI_API_KEY="your-api-key-here"
-$env:HTTPS_PROXY="http://127.0.0.1:7890"  # 可选：如果需要代理
+最后一条对应默认宿主端口，正常返回 `{"status":"ok"}`；健康检查只确认 HTTP 进程，不发送上游生成请求。不要将不带 `--quiet` 的 `docker compose config` 或完整 `docker inspect` 发给他人，其中可能含环境密钥。
+
+两个构建阶段使用 Node 24 Debian。锁文件中的 `sharp` 为 `0.35.5`，其引擎声明 `>=20.9.0`；镜像安装锁定的本平台可选二进制，构建时验证可以加载 `sharp`。运行阶段不带编译器，以 `node` 用户启动。Docker 会从镜像中 `node` 所有的两个目录初始化**新空命名卷**，默认无需 root 初始化容器。已有卷不会因重建镜像自动变更权限。
+
+可用只读检查确认身份、模板和实际写权限（不会创建文件或打印密钥）：
+
+```sh
+docker compose exec -T novelai-mcp node -e "const fs=require('node:fs'); if(process.getuid()===0) process.exit(1); for(const p of [process.env.MCP_DATA_DIR,process.env.MCP_IMAGE_ARCHIVE_DIR]) fs.accessSync(p,fs.constants.W_OK); fs.accessSync('/app/prompts/novelAI_prompt.md',fs.constants.R_OK)"
 ```
 
-**Windows CMD:**
-```cmd
-set NOVELAI_API_KEY=your-api-key-here
-set HTTPS_PROXY=http://127.0.0.1:7890
-```
+如果旧卷报权限错误，先停写并备份，再由管理员仅修正对应卷内的所有者/权限，不要改用 root 运行服务或放宽为全员可写。没有宿主端口时可在容器内检查 `http://127.0.0.1:3000/health`，或从同网反代检查 `http://novelai-mcp:3000/health`。
 
-> **⚠️ 重要**:
-> - PowerShell 使用 `$env:变量名`
-> - CMD 使用 `set 变量名`
-> - 不要混淆！在 PowerShell 里用 `set` 是不生效的
+## 3. HTTPS 反代：只去掉一层前缀
 
-## 第三步：启动服务器
+| 客户端请求 | 反代给 `novelai-mcp:3000` 的路径 |
+|---|---|
+| `https://api.chiyotobi.party/mcp/mcp` | `/mcp`；保留 POST、GET、DELETE 和浏览器 OPTIONS，以及原始鉴权和会话头 |
+| `https://api.chiyotobi.party/mcp/novelai-images/{id}.{ext}` | `/novelai-images/{id}.{ext}`；GET/HEAD，不缓存。图片下载不依赖客户端的个人 API Key |
+| `https://api.chiyotobi.party/mcp/health` | `/health`；正常时返回 HTTP 200。容器自己的探针仍直接访问 `/health` |
 
-```bash
-npm run start:http
-```
+**Caddy（上线配置）**：使用仓库的 [deploy/caddy-route.caddy](../deploy/caddy-route.caddy)。将片段放在已有 API 站点的 HTTPS 配置块内、兜底 `handle` 前；`handle_path /mcp/*` 已剥掉外层前缀，不要再 rewrite 一次。Caddy 与服务应在同一私网，反代目标是 `novelai-mcp:3000`。先备份原配置、校验完整配置，再平滑 reload；不要替换其他站点或证书配置。
 
-你应该看到：
-```
-🚀 NovelAI MCP Server (HTTP SSE mode) running on http://localhost:3000
-📡 SSE endpoint: http://localhost:3000/sse
-💬 Message endpoint: http://localhost:3000/message
-❤️  Health check: http://localhost:3000/health
-```
+**Nginx 等价示例**：将以下单个 `location` 放入现有的 TLS `server`。`proxy_pass` **末尾的 `/` 不能省**，它将 `/mcp/` 替换成 `/`，转发上表三条路径。如果 Nginx 运行在宿主机，则用 `http://127.0.0.1:13000/`（或相应回环端口）。
 
-## 第四步：测试服务器
-
-打开新的终端窗口，运行：
-
-```bash
-# 安装测试依赖
-npm install eventsource
-
-# 运行测试
-npm run test:http
-```
-
-如果一切正常，你会看到：
-```
-✅ Health check passed
-✅ SSE connection established
-✅ Message endpoint accessible
-✅ All tests passed!
-```
-
-## 第五步：配置客户端
-
-### LobeChat
-
-在 LobeChat 设置中添加 MCP 服务器：
-
-```json
-{
-  "url": "http://localhost:3000/sse",
-  "transport": "sse"
+```nginx
+location ^~ /mcp/ {
+    proxy_pass http://novelai-mcp:3000/;
+    proxy_http_version 1.1;
+    proxy_set_header Connection "";
+    proxy_set_header Host $host;
+    proxy_set_header X-Real-IP $remote_addr;
+    proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+    proxy_set_header X-Forwarded-Proto $scheme;
+    proxy_set_header X-Forwarded-Host $host;
+    proxy_set_header Authorization $http_authorization;
+    proxy_set_header Mcp-Session-Id $http_mcp_session_id;
+    proxy_set_header MCP-Protocol-Version $http_mcp_protocol_version;
+    proxy_buffering off;
+    proxy_request_buffering off;
+    proxy_cache off;
+    proxy_next_upstream off;
+    proxy_read_timeout 600s;
+    proxy_send_timeout 600s;
+    client_max_body_size 50m;
+    access_log off; # the image path itself grants temporary access
 }
 ```
 
-### Dify
+代理与服务端均不要记录 Authorization、请求体、会话 ID 或可用的图片链接。不注入默认密钥；保留默认传递的 `Accept`、`Content-Type`、`Last-Event-ID`、响应里的 `Mcp-Session-Id` 以及 `Cache-Control`。Nginx 用 `nginx -t` 校验，通过后 reload；若它只在启动时解析容器 DNS 名，容器重建后还需 reload 以解析新的 IP。配置生效后用 `curl -fsS https://api.chiyotobi.party/mcp/health` 检查完整前缀转发，预期 HTTP 200、`{"status":"ok"}`。
 
-在 Dify 的工具配置中：
-- **类型**: MCP Server
-- **传输方式**: HTTP (SSE)
-- **URL**: `http://localhost:3000/sse`
+通过代理建立两个独立客户端会话：匿名应列出 2 个工具；带个人密钥应列出 9 个。用 `get_nai_prompt` 验证完整模板即可，不必为探活发起付费图片请求。需做生成验收时，在获准消耗额度后生成一张，在 5 分钟内测试回执的原图、ID 和短链；默认 TTL 过后短链应为 404。
 
-### 其他支持 MCP 的应用
+## 4. 平滑切换与回滚
 
-只需配置 SSE 端点: `http://localhost:3000/sse`
+这是**单实例、有状态**服务。平滑切换靠排空请求和客户端重连，不是让两个版本同时读写同一账本。
 
-## 使用示例
+1. **变更前**：记录当前镜像 ID、唯一镜像标签、端口、卷名、网络名及反代配置，安全保存专用 `.env`。在候选版本的独立网络、卷、端口和模拟上游中先验收；不要把第二个别名 `novelai-mcp` 加进生产网。保留足够磁盘空间和已验证的旧镜像。
+2. **切换时**：先在反代暂停接收新调用，等在途生成和预占/回滚结束，勿自动重放请求。用 `docker compose stop novelai-mcp` 正常停止，再对**同一时间点的两个卷**做受限备份/快照（保留文件属主、权限及时间），记录与镜像的对应关系。不要删除卷或重置额度。
+3. **发布**：将 `MCP_IMAGE_TAG` 切至已验证的唯一标签，对应镜像已在本机时执行 `docker compose up -d --no-build --wait novelai-mcp`；必要时更新反代并验证配置。先查内部 `/health`、卷写权限、模板和两种工具清单，再放行流量。重启前的 MCP 会话需重新初始化。
+4. **回滚**：暂停新流量并排空、停止候选容器，将 `MCP_IMAGE_TAG` 与 Compose、反代配置恢复到已知健康版本，保留原有网络和卷。若数据格式向后兼容，优先复用现有卷以保留最新用量；若不兼容，先保全当前卷，确认变更后的业务记录如何对账，再离线恢复匹配的两个备份。**不能通过回滚旧账本丢弃已经成功的生成记录**。再次执行 `docker compose up -d --no-build --wait novelai-mcp`，按上述验收并让客户端重连后再放量。
 
-在连接的客户端中，你可以：
+切勿用 `docker compose down -v`、卷清理或跳过鉴权来排错。图像备份本身仍是敏感数据，应限制访问并按保留策略销毁；5 分钟的在线访问期限不是备份的保留授权。
 
-### 单人场景
-```
-帮我画一个蓝发动漫女孩，穿着校服，在樱花树下
-```
+## 常见故障
 
-AI 会自动调用 `generate_image` 工具，参数类似：
-```json
-{
-  "base_prompt": "masterpiece, best quality, detailed background, cherry blossoms",
-  "characters": [{
-    "prompt": "1girl, blue hair, school uniform, detailed face, beautiful eyes",
-    "negative_prompt": "",
-    "center_x": 0.5,
-    "center_y": 0.5
-  }],
-  "width": 832,
-  "height": 1216
-}
-```
-
-### 双人场景
-```
-画两个角色，左边是蓝发女孩，右边是红发男孩，教室场景
-```
-
-AI 会生成：
-```json
-{
-  "base_prompt": "masterpiece, best quality, classroom background, detailed",
-  "characters": [
-    {
-      "prompt": "1girl, blue hair, school uniform",
-      "center_x": 0.3,
-      "center_y": 0.5
-    },
-    {
-      "prompt": "1boy, red hair, school uniform",
-      "center_x": 0.7,
-      "center_y": 0.5
-    }
-  ]
-}
-```
-
-## 常见问题
-
-### 端口被占用
-```bash
-# 使用其他端口
-PORT=8080 npm run start:http
-```
-
-### 无法连接
-检查防火墙设置，确保端口开放：
-```bash
-# Windows: 允许端口 3000
-netsh advfirewall firewall add rule name="NovelAI MCP" dir=in action=allow protocol=TCP localport=3000
-
-# Linux: 使用 ufw
-sudo ufw allow 3000
-```
-
-### API Key 错误
-确保你的 NovelAI 订阅是活跃的，并且 API Key 正确。
-
-### 远程访问
-如果需要从其他机器访问：
-
-1. 确保服务器监听所有接口（已默认配置）
-2. 配置防火墙允许访问
-3. 使用服务器的 IP 地址：`http://your-server-ip:3000/sse`
-
-## 生产部署
-
-### 使用 PM2
-
-```bash
-# 安装 PM2
-npm install -g pm2
-
-# 创建配置文件 ecosystem.config.js
-cat > ecosystem.config.js << 'EOF'
-module.exports = {
-  apps: [{
-    name: 'novelai-mcp',
-    script: './dist/http-server.js',
-    env: {
-      PORT: 3000,
-      NOVELAI_API_KEY: 'your-api-key'
-    }
-  }]
-};
-EOF
-
-# 启动
-pm2 start ecosystem.config.js
-pm2 save
-pm2 startup
-```
-
-### 使用 Docker
-
-```bash
-# 构建镜像
-docker build -t novelai-mcp-server .
-
-# 运行容器
-docker run -d \
-  -p 3000:3000 \
-  -e NOVELAI_API_KEY="your-api-key" \
-  --name novelai-mcp \
-  --restart unless-stopped \
-  novelai-mcp-server
-```
-
-### 添加 HTTPS（使用 Nginx）
-
-```bash
-# 安装 Nginx
-sudo apt install nginx
-
-# 配置反向代理（参见 HTTP-MODE.md）
-```
-
-## 下一步
-
-- 查看 [HTTP-MODE.md](./HTTP-MODE.md) 了解详细配置
-- 查看 [EXAMPLES.md](./EXAMPLES.md) 了解更多生成示例
-- 查看 [CHARACTER-EXAMPLES.md](./CHARACTER-EXAMPLES.md) 了解多角色功能
-
-## 获取帮助
-
-- 提交 Issue: [GitHub Issues](https://github.com/yourusername/novelai-mcp-server/issues)
-- 查看日志: 服务器会输出详细的运行日志
-- 健康检查: `curl http://localhost:3000/health`
+- **网络不存在 / 上游不通**：核对 external network 名是否完全匹配、上游的网络别名和内部端口是否正确。容器内的 `localhost` 不是宿主或上游。
+- **公网 404 但 `/health` 正常**：先区分 MCP 入口与图片短链；核对路径是否只去掉一层 `/mcp`，图片是否过期、扩展名是否与回执一致。不要把 `MCP_IMAGE_PUBLIC_BASE_URL` 写成 `…/mcp/mcp`。
+- **付费客户端只看到 2 个工具**：确认每次请求都转发 Authorization；切换密钥或模式后新建会话，而非复用旧会话 ID。客户端应区分 Origin 拒绝、会话过期、个人密钥被上游拒绝和匿名额度用尽。
+- **图片请求超时**：检查代理缓冲、请求体大小、读取超时及客户端超时。先核对上游是否已成功，避免自动重试产生第二次费用。

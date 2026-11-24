@@ -1,5 +1,5 @@
 import assert from 'node:assert/strict';
-import { mkdtemp, mkdir, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
+import { lstat, mkdtemp, mkdir, readFile, readdir, rename, rm, stat, symlink, utimes, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import test from 'node:test';
@@ -8,9 +8,10 @@ import AdmZip from 'adm-zip';
 import sharp from 'sharp';
 import {
   ARCHIVE_ID_REGEX,
+  IMAGE_PATH,
+  archivePublicUrl,
+  cleanupExpiredImages,
   extractArchiveId,
-  getArchivedImageMetadata,
-  listArchivedImages,
   loadArchivedImage,
   saveArchivedImage,
   saveImage,
@@ -80,80 +81,247 @@ test('ZIP 返回全部非目录影像且以条目路径排序，媒体类型由�
   assert.throws(() => unpackImageResponse(empty.toBuffer()), /图像/);
 });
 
-test('归档保留 v1 PNG，v2 WebP 和 JPEG 按真实格式读写并按时间列出', async t => {
+const generated = { tool: 'generate_image', action: 'generate' };
+const notFound = { code: 'ENOENT' };
+const old = new Date('2000-01-01T00:00:00.000Z');
+
+async function readMetadata(directory, id) {
+  return JSON.parse(await readFile(join(directory, id, 'metadata.json'), 'utf8'));
+}
+
+async function patchMetadata(directory, id, fields) {
+  const metadata = { ...await readMetadata(directory, id), ...fields };
+  await writeFile(join(directory, id, 'metadata.json'), JSON.stringify(metadata));
+}
+
+test('归档使用随机 43 位 ID；原始 PNG、WebP、JPEG 逐字节往返，兼容 v1 PNG', async t => {
   const directory = await tempArchive(t);
   const png = await image(32, 32).png().toBuffer();
-  const webp = await image(32, 32).webp().toBuffer();
-  const jpg = await image(32, 32).jpeg().toBuffer();
-  const oldId = await saveImage(directory, png, {
-    prompt: '旧图片', model: 'nai-diffusion-5-curated', width: 32, height: 32, seed: 42,
-  });
-  const v1Directory = join(directory, oldId);
-  assert.deepEqual((await readdir(v1Directory)).sort(), ['image.png', 'metadata.json']);
-  const oldMetadata = await getArchivedImageMetadata(directory, oldId);
-  assert.equal(oldMetadata.schema_version, 1);
-  assert.equal(oldMetadata.seed, 42);
-  assert.deepEqual((await loadArchivedImage(directory, oldId)).buffer, png);
-  await writeFile(join(v1Directory, 'metadata.json'), JSON.stringify({
-    ...oldMetadata, created_at: '2000-01-01T00:00:00.000Z',
-  }));
-
-  const savedWebp = await saveArchivedImage(directory, webp, {
-    tool: 'generate_image', action: 'generate', width: 32, height: 32, seed: 43, prompt_preview: '新图片',
-  });
-  const savedJpg = await saveArchivedImage(directory, jpg, {
-    tool: 'augment_image', action: 'lineart', width: 32, height: 32,
-  });
-  assert.match(savedWebp.id, ARCHIVE_ID_REGEX);
-  assert.equal(savedWebp.filename, `${savedWebp.id}.webp`);
-  assert.equal(savedJpg.filename, `${savedJpg.id}.jpg`);
-  const loaded = await loadArchivedImage(directory, savedWebp.id);
-  assert.deepEqual(loaded.buffer, webp);
-  assert.equal(loaded.mimeType, 'image/webp');
-  assert.equal(loaded.metadata.ext, 'webp');
-  assert.equal(loaded.metadata.size_bytes, webp.length);
-  assert.equal(loaded.metadata.schema_version, 2);
-  assert.equal(loaded.metadata.prompt_preview, '新图片');
-  for (const file of ['image.webp', 'metadata.json']) {
-    assert.equal((await stat(join(directory, savedWebp.id, file))).mode & 0o777, 0o600);
+  const oldId = await saveImage(directory, png, { model: 'nai-diffusion-5-curated', width: 32, height: 32, seed: 42 });
+  const legacy = await loadArchivedImage(directory, oldId);
+  assert.equal(legacy.metadata.schema_version, 1);
+  assert.equal(legacy.metadata.seed, 42);
+  assert.deepEqual(legacy.buffer, png);
+  const ids = new Set([oldId]);
+  for (const [buffer, ext, mimeType] of [
+    [png, 'png', 'image/png'], [await image(32, 32).webp().toBuffer(), 'webp', 'image/webp'],
+    [await image(32, 32).jpeg().toBuffer(), 'jpg', 'image/jpeg'], [png, 'png', 'image/png'],
+  ]) {
+    const saved = await saveArchivedImage(directory, buffer, { ...generated, seed: 43, prompt_preview: '新图片' });
+    assert.match(saved.id, /^[A-Za-z0-9_-]{43}$/);
+    assert.ok(!ids.has(saved.id));
+    ids.add(saved.id);
+    assert.deepEqual(saved, { id: saved.id, filename: `${saved.id}.${ext}`, ext, mimeType });
+    const path = join(directory, saved.id);
+    assert.deepEqual((await readdir(path)).sort(), [`image.${ext}`, 'metadata.json']);
+    assert.deepEqual(await readFile(join(path, `image.${ext}`)), buffer);
+    const loaded = await loadArchivedImage(directory, saved.id);
+    assert.deepEqual(loaded.buffer, buffer);
+    assert.equal(loaded.ext, ext);
+    assert.equal(loaded.mimeType, mimeType);
+    assert.equal(loaded.metadata.size_bytes, buffer.length);
+    assert.equal(loaded.metadata.prompt_preview, '新图片');
+    if (process.platform !== 'win32') {
+      assert.equal((await stat(path)).mode & 0o777, 0o700);
+      for (const name of [`image.${ext}`, 'metadata.json']) assert.equal((await stat(join(path, name))).mode & 0o777, 0o600);
+    }
+    if (ext === 'jpg') {
+      await patchMetadata(directory, saved.id, { ext: 'webp' });
+      assert.equal((await loadArchivedImage(directory, saved.id)).mimeType, 'image/jpeg');
+    }
   }
-
-  const metadataPath = join(directory, savedJpg.id, 'metadata.json');
-  const jpgMetadata = JSON.parse(await readFile(metadataPath, 'utf8'));
-  await writeFile(metadataPath, JSON.stringify({
-    ...jpgMetadata, ext: 'webp', created_at: '2099-11-21T00:00:00.000Z',
-  }));
-  assert.deepEqual((await loadArchivedImage(directory, savedJpg.id)).buffer, jpg);
-  await mkdir(join(directory, '.pending-test'));
-  await mkdir(join(directory, '.vibe-cache'));
-  await symlink(v1Directory, join(directory, 'A'.repeat(43)), 'dir');
-  assert.deepEqual((await listArchivedImages(directory, 2)).map(item => item.id), [savedJpg.id, savedWebp.id]);
+  assert.deepEqual(new Set(await readdir(directory)), ids);
+  await assert.rejects(saveArchivedImage(directory, Buffer.from('GIF89a'), generated), /格式/);
   await assert.rejects(loadArchivedImage(directory, '../image.png'), /归档.*ID/);
-  await assert.rejects(loadArchivedImage(directory, 'A'.repeat(43)), { code: 'ENOENT' });
 });
 
-test('本站链接和裸 ID 直接读磁盘，纯 Base64、数据链接、stdio 路径和 GIF 均可导入', async t => {
+test('归档元数据大小、ID 与磁盘文件类型受限', async t => {
+  const directory = await tempArchive(t);
+  const png = await image(16, 16).png().toBuffer();
+  // 中文字符按 UTF-8 字节而不是 JS 字符数计限；失败不遗留暂存项。
+  await assert.rejects(saveArchivedImage(directory, png, { ...generated, note: '甲'.repeat(350_000) }), /元数据.*大小/);
+  assert.deepEqual(await readdir(directory), []);
+  const { id } = await saveArchivedImage(directory, png, generated);
+  await patchMetadata(directory, id, { id: 'A'.repeat(43) });
+  await assert.rejects(loadArchivedImage(directory, id), /元数据/);
+  await writeFile(join(directory, id, 'metadata.json'), Buffer.alloc(1024 * 1024 + 1));
+  await assert.rejects(loadArchivedImage(directory, id), /大小限制/);
+});
+
+test('公网链接同时匹配原站和完整前缀；本地路由不带前缀', async t => {
+  const directory = await tempArchive(t);
+  const bytes = await image(16, 16).webp().toBuffer();
+  const saved = await saveArchivedImage(directory, bytes, generated);
+  assert.equal(IMAGE_PATH, '/novelai-images/');
+  assert.match(saved.id, ARCHIVE_ID_REGEX);
+  assert.equal(extractArchiveId(saved.id), saved.id);
+  for (const [basePath, prefix] of [['', ''], ['/', ''], ['/mcp', '/mcp'], ['/mcp/', '/mcp'], ['/a/b/', '/a/b']]) {
+    const origin = new URL(`https://127.0.0.1:444${basePath}`);
+    const url = `${origin.origin}${prefix}/novelai-images/${saved.filename}`;
+    const options = { archiveDir: directory, imageOrigin: origin };
+    assert.equal(archivePublicUrl(origin, saved.id, saved.ext), url);
+    assert.equal(extractArchiveId(url, origin), saved.id);
+    assert.deepEqual(await resolveImageInput(url, options), bytes);
+    for (const invalid of [
+      `${url}?q=1`, `${url}#`, url.replace(IMAGE_PATH, '/x/../novelai-images/'),
+      url.replace('.webp', '.html'),
+    ]) {
+      assert.equal(extractArchiveId(invalid, origin), null);
+      await assert.rejects(resolveImageInput(invalid, options), /本站归档图像链接无效/);
+    }
+    await assert.rejects(resolveImageInput(url.replace('.webp', '.jpg'), options), notFound);
+    await assert.rejects(resolveImageInput(url, { imageOrigin: origin }), /归档目录/);
+    for (const mismatch of [
+      url.replace(':444', ':443'), url.replace('127.0.0.1', '127.0.0.2'),
+      url.replace(IMAGE_PATH, '/another-prefix/novelai-images/'),
+      ...(prefix ? [url.replace(prefix + IMAGE_PATH, IMAGE_PATH)] : []),
+    ]) {
+      assert.equal(extractArchiveId(mismatch, origin), null);
+      await assert.rejects(resolveImageInput(mismatch, options), /公网|保留/);
+    }
+  }
+});
+
+test('ID 和公网前缀输入实时执行 TTL，正好到期即 ENOENT（清理前亦然）', async t => {
+  const archiveDir = await tempArchive(t);
+  const png = await image(16, 16).png().toBuffer();
+  const { id } = await saveArchivedImage(archiveDir, png, generated);
+  const created = Date.parse((await readMetadata(archiveDir, id)).created_at);
+  const imageOrigin = new URL('https://127.0.0.1/mcp/');
+  const url = archivePublicUrl(imageOrigin, id, 'png');
+  let now = created;
+  t.mock.method(Date, 'now', () => now);
+  for (const ttl of [300_000, 1_234]) {
+    const options = { archiveDir, imageOrigin, ...(ttl !== 300_000 && { imageTtlMs: ttl }) };
+    const load = () => loadArchivedImage(archiveDir, id, ttl === 300_000 ? undefined : { ttlMs: ttl });
+    now = created + ttl - 1;
+    assert.deepEqual((await load()).buffer, png);
+    for (const ref of [id, url]) assert.deepEqual(await resolveImageInput(ref, options), png);
+    now++;
+    await assert.rejects(load(), notFound);
+    for (const ref of [id, url]) await assert.rejects(resolveImageInput(ref, options), notFound);
+    now++;
+    await assert.rejects(load(), notFound);
+    assert.deepEqual(await readFile(join(archiveDir, id, 'image.png')), png);
+  }
+  await assert.rejects(loadArchivedImage(archiveDir, id, { ttlMs: NaN }), /有效期/);
+  await assert.rejects(cleanupExpiredImages(archiveDir, -1), /有效期/);
+  await assert.rejects(resolveImageInput('X'.repeat(43), { archiveDir, imageOrigin }), notFound);
+  await assert.rejects(resolveImageInput(archivePublicUrl(imageOrigin, 'X'.repeat(43), 'png'), { archiveDir, imageOrigin }), notFound);
+});
+
+test('私有条目对公开下载和工具输入不可见', async t => {
+  const archiveDir = await tempArchive(t);
+  const bytes = await image(16, 16).png().toBuffer();
+  const { id } = await saveArchivedImage(archiveDir, bytes, { ...generated, private: true });
+  const imageOrigin = new URL('https://127.0.0.1/mcp');
+  assert.deepEqual((await loadArchivedImage(archiveDir, id)).buffer, bytes);
+  await assert.rejects(loadArchivedImage(archiveDir, id, { publicOnly: true }), notFound);
+  for (const ref of [id, archivePublicUrl(imageOrigin, id, 'png')]) {
+    await assert.rejects(resolveImageInput(ref, { archiveDir, imageOrigin }), notFound);
+  }
+});
+
+test('清理只删除到期的自有归档和可识别的旧暂存目录', async t => {
+  const directory = await tempArchive(t);
+  const bytes = await image(16, 16).png().toBuffer();
+  const save = async () => (await saveArchivedImage(directory, bytes, generated)).id;
+  const [due, fresh, contaminated, staged, legacy, wrongId] = await Promise.all([
+    save(), save(), save(), save(), saveImage(directory, bytes, { seed: 3 }), save(),
+  ]);
+  const now = Date.now();
+  const ttl = 300_000;
+  t.mock.method(Date, 'now', () => now);
+  for (const id of [due, legacy, contaminated, staged, wrongId]) {
+    await patchMetadata(directory, id, { created_at: new Date(now - ttl).toISOString() });
+  }
+  await patchMetadata(directory, fresh, { created_at: new Date(now - ttl + 1).toISOString() });
+  await patchMetadata(directory, wrongId, { id: fresh });
+  await writeFile(join(directory, contaminated, 'user-note.txt'), '保留');
+  await rename(join(directory, staged), join(directory, '.pending-ABC123'));
+  await utimes(join(directory, '.pending-ABC123'), old, old);
+  const unrelated = ['.vibe-cache', '.pending-ZZ1234', 'quota', 'B'.repeat(43)];
+  for (const name of unrelated) {
+    await mkdir(join(directory, name));
+    await writeFile(join(directory, name, 'keep.json'), '保留');
+    await utimes(join(directory, name), old, old);
+  }
+  const plainFile = join(directory, 'C'.repeat(43));
+  await writeFile(plainFile, '不是归档');
+  await writeFile(join(directory, 'quota.json'), '额度');
+  assert.equal(await cleanupExpiredImages(directory, ttl), undefined);
+  await cleanupExpiredImages(directory, ttl); // 可安全重复调用。
+  for (const name of [due, legacy, '.pending-ABC123']) await assert.rejects(lstat(join(directory, name)), notFound);
+  assert.deepEqual((await loadArchivedImage(directory, fresh, { ttlMs: ttl })).buffer, bytes);
+  for (const name of unrelated) assert.equal(await readFile(join(directory, name, 'keep.json'), 'utf8'), '保留');
+  assert.equal(await readFile(join(directory, contaminated, 'user-note.txt'), 'utf8'), '保留');
+  assert.deepEqual(await readFile(join(directory, wrongId, 'image.png')), bytes);
+  assert.equal(await readFile(plainFile, 'utf8'), '不是归档');
+  assert.equal(await readFile(join(directory, 'quota.json'), 'utf8'), '额度');
+});
+
+test('读取和清理均不跟随归档根或 ID 目录链接', async t => {
+  const directory = await tempArchive(t);
+  const outside = await tempArchive(t);
+  const bytes = await image(16, 16).png().toBuffer();
+  const { id } = await saveArchivedImage(outside, bytes, generated);
+  const rootLink = join(directory, 'archive-link');
+  const idLink = join(directory, id);
+  const type = process.platform === 'win32' ? 'junction' : 'dir';
+  await symlink(outside, rootLink, type);
+  await symlink(join(outside, id), idLink, type);
+  await assert.rejects(loadArchivedImage(rootLink, id), notFound);
+  await assert.rejects(saveArchivedImage(rootLink, bytes, generated), notFound);
+  await assert.rejects(loadArchivedImage(directory, id), notFound);
+  await cleanupExpiredImages(rootLink, 0);
+  await cleanupExpiredImages(directory, 0);
+  assert.ok((await lstat(rootLink)).isSymbolicLink());
+  assert.ok((await lstat(idLink)).isSymbolicLink());
+  assert.deepEqual(await readFile(join(outside, id, 'image.png')), bytes);
+});
+
+test('清理保留伪图像以及内部文件被替换为链接的目录', async t => {
+  const directory = await tempArchive(t);
+  const outside = await tempArchive(t);
+  const png = await image(16, 16).png().toBuffer();
+  const forged = await saveArchivedImage(directory, png, generated);
+  const forgedPath = join(directory, forged.id, 'image.png');
+  const otherBytes = Buffer.alloc(png.length, 0x41);
+  await writeFile(forgedPath, otherBytes);
+  await cleanupExpiredImages(directory, 0);
+  assert.deepEqual(await readFile(forgedPath), otherBytes);
+  for (const name of ['metadata.json', 'image.png']) {
+    const { id } = await saveArchivedImage(directory, png, generated);
+    const path = join(directory, id, name);
+    const target = join(outside, name);
+    const original = await readFile(path);
+    await rename(path, target);
+    try {
+      await symlink(target, path, 'file');
+    } catch (error) {
+      if (process.platform !== 'win32' || error.code !== 'EPERM') throw error;
+      // Windows 非特权账户仍可用 junction 测试同一个叶节点不能是重解析点。
+      await symlink(outside, path, 'junction');
+    }
+    await assert.rejects(loadArchivedImage(directory, id), notFound);
+    await cleanupExpiredImages(directory, 0);
+    assert.ok((await lstat(path)).isSymbolicLink());
+    assert.deepEqual(await readFile(target), original);
+  }
+});
+
+test('纯 Base64、数据链接和 GIF 可导入；任意传输都不接受 file: 或本地路径', async t => {
   const directory = await tempArchive(t);
   const png = await image(16, 16).png().toBuffer();
   const gif = await image(16, 16).gif().toBuffer();
-  const saved = await saveArchivedImage(directory, png, { tool: 'generate_image', action: 'generate' });
-  const origin = new URL('https://images.invalid/');
-  const url = `${origin.origin}/novelai-images/${saved.filename}`;
-  assert.equal(extractArchiveId(saved.id), saved.id);
-  assert.equal(extractArchiveId(url, origin), saved.id);
-  assert.equal(extractArchiveId(`${url}?q=1`, origin), null);
-  assert.equal(extractArchiveId(url.replace('images.invalid', 'other.invalid'), origin), null);
-  assert.equal(extractArchiveId(`${origin.origin}/extra/../novelai-images/${saved.filename}`, origin), null);
-  assert.deepEqual(await resolveImageInput(url, { archiveDir: directory, imageOrigin: origin }), png);
-  assert.deepEqual(await resolveImageInput(saved.id, { archiveDir: directory }), png);
   assert.deepEqual(await resolveImageInput(png.toString('base64'), {}), png);
   assert.deepEqual(await resolveImageInput(`data:image/gif;base64,${gif.toString('base64')}`, {}), gif);
   assert.deepEqual(await resolveImageInput(gif.toString('base64').replace(/=+$/, ''), {}), gif);
   const path = join(directory, 'source.png');
   await writeFile(path, png);
-  assert.deepEqual(await resolveImageInput(path, { allowLocalFiles: true }), png);
-  await assert.rejects(resolveImageInput(path, {}), /本地文件/);
-  await assert.rejects(resolveImageInput(`file://${path}`, { allowLocalFiles: true }), /HTTPS/i);
+  for (const ref of [path, `file://${path}`, 'FILE:source.png', './source.png', '../source.png', 'C:\\source.png', '\\\\host\\source.png']) {
+    await assert.rejects(resolveImageInput(ref, {}), /禁止读取本地文件/);
+  }
   await assert.rejects(resolveImageInput('data:image/png;base64,@@@', {}), /Base64/i);
   await assert.rejects(resolveImageInput(`data:image/png;base64,${png.toString('base64')}****`, {}), /Base64/i);
 });

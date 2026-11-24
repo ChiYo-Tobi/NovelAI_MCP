@@ -1,0 +1,2 @@
+# Ship this user-supplied template byte-for-byte, including on Windows.
+/prompts/novelAI_prompt.md -text -whitespace

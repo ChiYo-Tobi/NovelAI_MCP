@@ -1,21 +1,9 @@
-export type DisclosureMode = 'progressive' | 'legacy';
-export const DEFAULT_DISCLOSURE_MODE: DisclosureMode = 'progressive';
-
-export function isDisclosureMode(value: unknown): value is DisclosureMode {
-  return value === 'progressive' || value === 'legacy';
-}
-
-export const DEFAULT_MODEL = 'nai-diffusion-5-curated';
+export const DEFAULT_MODEL = 'nai-diffusion-5-full';
 export const IMAGE_MODELS = [
   DEFAULT_MODEL,
-  'nai-diffusion-5-full',
-  'nai-diffusion-5-full-medium',
+  'nai-diffusion-5-curated',
   'nai-diffusion-4-5-full',
   'nai-diffusion-4-5-curated',
-  'nai-diffusion-4-full',
-  'nai-diffusion-4-curated-preview',
-  'nai-diffusion-3',
-  'nai-diffusion-furry-3',
 ] as const;
 export type Model = (typeof IMAGE_MODELS)[number];
 
@@ -124,13 +112,9 @@ export interface ImageGenerationParams {
   scale?: number;
   sampler?: Sampler;
   seed?: number;
-  n_samples?: number;
+  n_samples?: 1;
   uncond_scale?: number;
   noise_schedule?: NoiseSchedule;
-  sm?: boolean;
-  sm_dyn?: boolean;
-  autoSmea?: boolean;
-  dynamic_thresholding?: boolean;
   cfg_rescale?: number;
   qualityToggle?: boolean;
   qualityPresetId?: QualityPreset;
@@ -154,12 +138,7 @@ export interface ImageGenerationParams {
   mask?: string;
   add_original_image?: boolean;
   inpaintImg2ImgStrength?: number;
-  controlnet_condition?: string;
-  controlnet_model?: string;
-  controlnet_strength?: number;
   reference_image_multiple?: string[];
-  reference_information_extracted?: number[];
-  reference_information_extracted_multiple?: number[];
   reference_strength?: number;
   reference_strength_multiple?: number[];
   normalize_reference_strength_multiple?: boolean;
@@ -176,20 +155,16 @@ export interface NovelAIRequestPayload {
     scale: number;
     sampler: Sampler;
     steps: number;
-    n_samples: number;
+    n_samples: 1;
     seed: number;
     ucPreset?: number;
     ucPresetId?: UcPresetName;
     qualityToggle?: boolean;
     qualityPresetId?: QualityPreset;
-    autoSmea?: boolean;
-    dynamic_thresholding?: boolean;
-    controlnet_strength?: number;
     legacy?: boolean;
     add_original_image?: boolean;
     cfg_rescale: number;
     noise_schedule?: NoiseSchedule;
-    legacy_v3_extend?: boolean;
     skip_cfg_above_sigma: number | null;
     use_coords?: boolean;
     normalize_reference_strength_multiple?: boolean;
@@ -259,17 +234,6 @@ export interface TagSuggestion {
   tag: string;
   count?: number;
   [key: string]: unknown;
-}
-
-export interface SubscriptionSummary {
-  tier: number;
-  tierName: string;
-  active: boolean;
-  expiresAt: string | null;
-  fixedAnlas: number;
-  purchasedAnlas: number;
-  totalAnlas: number;
-  v5Usage: Record<string, unknown> | null;
 }
 
 export interface ImageGenerationResponse {

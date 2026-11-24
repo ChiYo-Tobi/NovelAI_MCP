@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from 'node:crypto';
-import { mkdir, readFile, readdir, rename, stat, unlink, writeFile } from 'node:fs/promises';
-import { join } from 'node:path';
+import { constants } from 'node:fs';
+import { lstat, mkdir, open, rename, unlink } from 'node:fs/promises';
+import { join, resolve } from 'node:path';
 import { ENCODE_VIBE_MODELS } from './model-registry.js';
 import type { Model } from './types.js';
 
@@ -39,13 +40,23 @@ function vibeId(key: string): string {
 }
 
 export class VibeCache {
-  private readonly directory?: string;
+  private readonly dataDir?: string;
   private readonly memory = new Map<string, VibeCacheEntry>();
   private readonly pending = new Map<string, Promise<VibeCacheEntry>>();
   private memoryBytes = 0;
 
-  constructor(archiveDir?: string) {
-    if (archiveDir) this.directory = join(archiveDir, '.vibe-cache');
+  constructor(dataDir?: string) {
+    if (dataDir) this.dataDir = resolve(dataDir);
+  }
+
+  private async cacheDirectory(create: boolean): Promise<string> {
+    const root = this.dataDir!;
+    if (create) await mkdir(root, { recursive: true, mode: 0o700 });
+    if (!(await lstat(root)).isDirectory()) throw new Error('Vibe 数据目录不能是链接');
+    const directory = join(root, '.vibe-cache');
+    if (create) await mkdir(directory, { recursive: true, mode: 0o700 });
+    if (!(await lstat(directory)).isDirectory()) throw new Error('Vibe 缓存目录不能是链接');
+    return directory;
   }
 
   private remember(entry: VibeCacheEntry): void {
@@ -74,15 +85,21 @@ export class VibeCache {
       this.remember(cached);
       return cached;
     }
-    if (!this.directory) return undefined;
+    if (!this.dataDir) return undefined;
 
     try {
-      const filename = join(this.directory, `${id}.json`);
-      const info = await stat(filename);
+      const filename = join(await this.cacheDirectory(false), `${id}.json`);
+      const info = await lstat(filename);
       if (!info.isFile() || info.size > MAX_ENTRY_BYTES + 1024) return undefined;
-      const entry = JSON.parse(await readFile(filename, {
-        encoding: 'utf8', signal: AbortSignal.timeout(FILE_TIMEOUT),
-      })) as VibeCacheEntry | null;
+      const file = await open(filename, constants.O_RDONLY | constants.O_NOFOLLOW | constants.O_NONBLOCK);
+      let entry: VibeCacheEntry | null;
+      try {
+        const current = await file.stat();
+        if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino || current.size !== info.size) return undefined;
+        entry = JSON.parse(await file.readFile({ encoding: 'utf8', signal: AbortSignal.timeout(FILE_TIMEOUT) }));
+      } finally {
+        await file.close();
+      }
       if (!entry || entry.id !== id || !ENCODE_VIBE_MODELS.includes(entry.model)
         || typeof entry.encoded_vibe !== 'string' || !entry.encoded_vibe || entry.encoded_vibe.length > MAX_ENTRY_BYTES
         || !Number.isFinite(entry.information_extracted) || entry.information_extracted < 0 || entry.information_extracted > 1
@@ -105,17 +122,22 @@ export class VibeCache {
       throw new Error('上游返回的 Vibe 编码为空或超出缓存大小限制');
     }
     this.remember(entry);
-    if (this.directory) {
-      const temporary = join(this.directory, `.pending-${randomUUID()}`);
+    if (this.dataDir) {
+      let temporary: string | undefined;
       try {
-        await mkdir(this.directory, { recursive: true, mode: 0o700 });
-        await writeFile(temporary, JSON.stringify(entry), {
-          flag: 'wx', mode: 0o600, signal: AbortSignal.timeout(FILE_TIMEOUT),
-        });
-        await rename(temporary, join(this.directory, `${entry.id}.json`));
+        const directory = await this.cacheDirectory(true);
+        const path = join(directory, `.pending-${randomUUID()}`);
+        const file = await open(path, 'wx', 0o600);
+        temporary = path;
+        try {
+          await file.writeFile(JSON.stringify(entry), { signal: AbortSignal.timeout(FILE_TIMEOUT) });
+        } finally {
+          await file.close();
+        }
+        await rename(path, join(directory, `${entry.id}.json`));
       } catch {
         console.error('写入 Vibe 磁盘缓存失败，本次编码已存入内存。');
-        await unlink(temporary).catch(() => {});
+        if (temporary) await unlink(temporary).catch(() => {});
       }
     }
     return entry;
@@ -142,23 +164,5 @@ export class VibeCache {
     } finally {
       this.pending.delete(key);
     }
-  }
-
-  async list(): Promise<Omit<VibeCacheEntry, 'encoded_vibe'>[]> {
-    const summaries = new Map<string, Omit<VibeCacheEntry, 'encoded_vibe'>>();
-    const add = ({ encoded_vibe: _encoding, ...summary }: VibeCacheEntry) => summaries.set(summary.id, summary);
-    for (const entry of this.memory.values()) add(entry);
-    if (this.directory) {
-      const files = await readdir(this.directory).catch(error => {
-        if ((error as NodeJS.ErrnoException).code === 'ENOENT') return [];
-        throw error;
-      });
-      for (const filename of files) {
-        if (!filename.endsWith('.json')) continue;
-        const entry = await this.getById(filename.slice(0, -5));
-        if (entry) add(entry);
-      }
-    }
-    return [...summaries.values()].sort((a, b) => b.created_at.localeCompare(a.created_at));
   }
 }

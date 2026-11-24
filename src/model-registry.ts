@@ -8,20 +8,14 @@ export interface ModelCapability {
   defaultScale: number;
   maxCharacters: number;
   supportsVibe: boolean;
-  supportsVibeInInpaint: boolean;
+  supportsVibeInInpaint: false;
   vibeRequiresEncode: boolean;
   supportsPreciseRef: boolean;
   supportsTransparent: boolean;
-  supportsSmea: boolean;
-  supportsDecrisp: boolean;
-  supportsNativeSchedule: boolean;
   varietyBase: number | null;
   preferBrownian: boolean;
   inpaintingModel: string;
   inpaintingFallbackNotice?: string;
-  isV3: boolean;
-  isMediumLocked: boolean;
-  legacyUcDefault: boolean;
 }
 
 const v5 = {
@@ -34,23 +28,17 @@ const v5 = {
   vibeRequiresEncode: false,
   supportsPreciseRef: false,
   supportsTransparent: true,
-  supportsSmea: false,
-  supportsDecrisp: false,
-  supportsNativeSchedule: false,
   varietyBase: null,
   preferBrownian: false,
-  isV3: false,
-  isMediumLocked: false,
-  legacyUcDefault: false,
 } as const;
 
 const v45 = {
-  ...v5,
   paramsVersion: 3,
   defaultSteps: 28,
   defaultScale: 6,
   maxCharacters: 6,
   supportsVibe: true,
+  supportsVibeInInpaint: false,
   vibeRequiresEncode: true,
   supportsPreciseRef: true,
   supportsTransparent: false,
@@ -58,45 +46,15 @@ const v45 = {
   preferBrownian: true,
 } as const;
 
-const v4 = {
-  ...v45,
-  defaultSteps: 23,
-  defaultScale: 5.5,
-  supportsVibeInInpaint: true,
-  supportsPreciseRef: false,
-  varietyBase: 19,
-  legacyUcDefault: true,
-} as const;
-
-const v3 = {
-  ...v4,
-  defaultScale: 5,
-  maxCharacters: 0,
-  vibeRequiresEncode: false,
-  isV3: true,
-  supportsSmea: true,
-  supportsDecrisp: true,
-  supportsNativeSchedule: true,
-  preferBrownian: false,
-  legacyUcDefault: false,
-} as const;
-
 export const MODEL_REGISTRY: Readonly<Record<Model, ModelCapability>> = {
+  'nai-diffusion-5-full': { ...v5, inpaintingModel: 'nai-diffusion-5-full-inpainting' },
   'nai-diffusion-5-curated': {
     ...v5,
     inpaintingModel: 'nai-diffusion-5-full-inpainting',
-    inpaintingFallbackNotice: 'V5 Curated 官方无独立 inpainting 模型，已自动使用同代 nai-diffusion-5-full-inpainting。',
-  },
-  'nai-diffusion-5-full': { ...v5, inpaintingModel: 'nai-diffusion-5-full-inpainting' },
-  'nai-diffusion-5-full-medium': {
-    ...v5, defaultSteps: 14, isMediumLocked: true, inpaintingModel: 'nai-diffusion-5-full-medium-inpainting',
+    inpaintingFallbackNotice: 'V5 Curated 无独立重绘模型，已使用同代 nai-diffusion-5-full-inpainting。',
   },
   'nai-diffusion-4-5-full': { ...v45, inpaintingModel: 'nai-diffusion-4-5-full-inpainting' },
   'nai-diffusion-4-5-curated': { ...v45, defaultScale: 5, inpaintingModel: 'nai-diffusion-4-5-curated-inpainting' },
-  'nai-diffusion-4-full': { ...v4, inpaintingModel: 'nai-diffusion-4-full-inpainting' },
-  'nai-diffusion-4-curated-preview': { ...v4, inpaintingModel: 'nai-diffusion-4-curated-inpainting' },
-  'nai-diffusion-3': { ...v3, inpaintingModel: 'nai-diffusion-3-inpainting' },
-  'nai-diffusion-furry-3': { ...v3, defaultScale: 6.2, inpaintingModel: 'nai-diffusion-furry-3-inpainting' },
 };
 
 export const ENCODE_VIBE_MODELS = IMAGE_MODELS.filter(model => MODEL_REGISTRY[model].vibeRequiresEncode);
@@ -130,31 +88,28 @@ export function resolveGenerationModel(value?: unknown, action: Action = 'genera
   const requestedModel = resolveImageModel(value);
   const capability = MODEL_REGISTRY[requestedModel];
   if (action !== 'infill') return { requestedModel, model: requestedModel, capability };
-  const fallbackNotice = capability.inpaintingFallbackNotice;
   return {
     requestedModel,
     model: capability.inpaintingModel,
-    capability: fallbackNotice ? MODEL_REGISTRY['nai-diffusion-5-full'] : capability,
-    fallbackNotice,
+    capability,
+    fallbackNotice: capability.inpaintingFallbackNotice,
   };
 }
 
 export function validateGenerationFeatures(params: ImageGenerationParams, capability: ModelCapability): void {
+  const vibeCount = (params.vibeReferences?.length ?? 0) + (params.reference_image_multiple?.length ?? 0);
+  if (vibeCount > 0 && params.action === 'infill') {
+    throw new Error('同代局部重绘不支持任何 Vibe Transfer 参考，不会回退到其他模型；请移除 Vibe 参考。');
+  }
   if ((params.characterPrompts?.length ?? 0) > capability.maxCharacters) {
-    throw new Error(capability.maxCharacters === 0
-      ? 'V3 模型不支持独立角色提示词，请将角色描述写入 base_prompt'
-      : `当前模型最多支持 ${capability.maxCharacters} 个独立角色提示词`);
+    throw new Error(`当前模型最多支持 ${capability.maxCharacters} 个独立角色提示词`);
   }
   if (params.transparent_background && !capability.supportsTransparent) {
     throw new Error('实际出图模型不支持透明背景，请选择支持该功能的 V5 模型');
   }
   const hasPrecise = Boolean(params.characterReferences?.length);
-  const vibeCount = (params.vibeReferences?.length ?? 0) + (params.reference_image_multiple?.length ?? 0);
   if (hasPrecise && vibeCount > 0) throw new Error('精确参考与 Vibe Transfer 不能同时使用');
   if (hasPrecise && !capability.supportsPreciseRef) throw new Error('精确参考仅支持 V4.5 模型');
+  if (vibeCount > 0 && !capability.supportsVibe) throw new Error('Vibe Transfer 仅支持 V4.5 非局部重绘请求');
   if (vibeCount > MAX_VIBE_REFERENCES) throw new Error(`Vibe Transfer 最多支持 ${MAX_VIBE_REFERENCES} 张参考图`);
-  if (vibeCount > 0 && !capability.supportsVibe) throw new Error('实际出图模型不支持 Vibe Transfer，请选择 V3、V4 或 V4.5');
-  if (vibeCount > 0 && params.action === 'infill' && !capability.supportsVibeInInpaint) {
-    throw new Error('V4.5 局部重绘不支持 Vibe Transfer，请选择 V4 或 V3');
-  }
 }

@@ -1,12 +1,10 @@
 import { lookup } from 'node:dns/promises';
-import { constants } from 'node:fs';
-import { open } from 'node:fs/promises';
 import type { IncomingMessage } from 'node:http';
 import { get } from 'node:https';
 import { BlockList, isIP } from 'node:net';
 import { inflateSync } from 'node:zlib';
 import sharp from 'sharp';
-import { extractArchiveId, loadArchivedImage } from './image-archive.js';
+import { extractArchiveId, isArchivePublicPath, loadArchivedImage } from './image-archive.js';
 import { decodeBase64, sniffImageFormat } from './response-unpack.js';
 import type { MaskRegion } from './types.js';
 
@@ -113,8 +111,10 @@ function verifyInputImage(buffer: Buffer): Buffer {
 export interface ResolveImageInputOptions {
   archiveDir?: string;
   imageOrigin?: URL;
-  allowLocalFiles?: boolean;
+  imageTtlMs?: number;
 }
+
+const LOCAL_FILE_ERROR = '禁止读取本地文件路径或 file: 链接。请传入归档 ID、HTTPS 图像链接或图像 Base64';
 
 export async function resolveImageInput(input: string, options: ResolveImageInputOptions): Promise<Buffer> {
   if (typeof input !== 'string' || !input.trim()) throw new Error('图像输入不能为空');
@@ -122,7 +122,11 @@ export async function resolveImageInput(input: string, options: ResolveImageInpu
   const archiveId = extractArchiveId(value, options.imageOrigin);
   if (archiveId) {
     if (!options.archiveDir) throw new Error('当前服务没有配置图像归档目录');
-    return (await loadArchivedImage(options.archiveDir, archiveId)).buffer;
+    const image = await loadArchivedImage(options.archiveDir, archiveId, { publicOnly: true, ttlMs: options.imageTtlMs });
+    if (value !== archiveId && !value.endsWith(`.${image.ext}`)) {
+      throw Object.assign(new Error('找不到此格式的归档图像'), { code: 'ENOENT' });
+    }
+    return image.buffer;
   }
   if (/^data:/i.test(value)) {
     const comma = value.indexOf(',');
@@ -131,26 +135,21 @@ export async function resolveImageInput(input: string, options: ResolveImageInpu
     }
     return verifyInputImage(decodeBase64(value.slice(comma + 1), MAX_IMAGE_INPUT_BYTES));
   }
-  if (/^[a-z][a-z0-9+.-]*:/i.test(value) && !/^[a-z]:[/\\]/i.test(value)) {
+  if (/^(?:file|[a-z]):/i.test(value)) throw new Error(LOCAL_FILE_ERROR);
+  if (/^[a-z][a-z0-9+.-]*:/i.test(value)) {
     if (!/^https:\/\//i.test(value)) throw new Error('远程图像仅支持 HTTPS 地址');
-    return verifyInputImage(await downloadImage(new URL(value)));
+    const url = new URL(value);
+    if (options.imageOrigin && isArchivePublicPath(url, options.imageOrigin)) {
+      throw new Error('本站归档图像链接无效，请使用完整的原始下载链接或归档 ID');
+    }
+    return verifyInputImage(await downloadImage(url));
   }
   if (value.length % 4 !== 1 && (value.length % 4 === 0 || !value.endsWith('=')) &&
       /^[A-Za-z0-9+/]+={0,2}$/.test(value)) {
     const buffer = decodeBase64(value, MAX_IMAGE_INPUT_BYTES);
     if (isInputImage(buffer)) return buffer;
   }
-  if (!options.allowLocalFiles) throw new Error('HTTP 模式禁止读取本地文件。请传入归档 ID、HTTPS 链接或图像 Base64');
-  const signal = AbortSignal.timeout(TIMEOUT_MS);
-  const file = await open(value, constants.O_RDONLY | constants.O_NONBLOCK);
-  try {
-    const stat = await file.stat();
-    if (!stat.isFile()) throw new Error('图像路径须指向普通文件');
-    if (stat.size > MAX_IMAGE_INPUT_BYTES) throw new Error('本地图像超过大小限制');
-    return verifyInputImage(await file.readFile({ signal }));
-  } finally {
-    await file.close();
-  }
+  throw new Error(LOCAL_FILE_ERROR);
 }
 
 function pipeline(input: Buffer) {

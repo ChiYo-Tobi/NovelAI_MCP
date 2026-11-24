@@ -1,0 +1,41 @@
+services:
+  novelai-mcp:
+    build: .
+    image: novelai-mcp:${MCP_IMAGE_TAG:-local}
+    # A fixed name also prevents Compose from scaling a second quota writer.
+    container_name: novelai-mcp
+    restart: unless-stopped
+    init: true
+    stop_grace_period: 60s
+    # Use a dedicated, untracked .env; the default API key has no other source here.
+    env_file:
+      - .env
+    environment:
+      PORT: "3000"
+      MCP_BIND_HOST: "0.0.0.0"
+      UPSTREAM_BASE_URL: "${UPSTREAM_BASE_URL:-http://qiandaiapi-app:8080}"
+      MCP_ALLOWED_ORIGINS: "${MCP_ALLOWED_ORIGINS:-*}"
+      MCP_IMAGE_PUBLIC_BASE_URL: "${MCP_IMAGE_PUBLIC_BASE_URL:-https://api.chiyotobi.party/mcp}"
+      MCP_IMAGE_TTL_SECONDS: "${MCP_IMAGE_TTL_SECONDS:-300}"
+      MCP_DATA_DIR: /var/lib/novelai-mcp/data
+      MCP_IMAGE_ARCHIVE_DIR: /var/lib/novelai-mcp/images
+    ports:
+      - "127.0.0.1:${MCP_HOST_PORT:-13000}:3000"
+    volumes:
+      - data:/var/lib/novelai-mcp/data
+      - images:/var/lib/novelai-mcp/images
+    networks:
+      upstream:
+        aliases:
+          - novelai-mcp
+
+networks:
+  upstream:
+    external: true
+    name: "${MCP_DOCKER_NETWORK:?Set the existing private network name in .env}"
+
+volumes:
+  data:
+    name: novelai-mcp-data
+  images:
+    name: novelai-mcp-images

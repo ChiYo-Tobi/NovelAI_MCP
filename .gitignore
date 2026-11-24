@@ -4,11 +4,23 @@ node_modules/
 # Build output
 dist/
 
-# Environment variables
+# Operator settings and credentials; only the placeholder example belongs in Git.
 .env
-.env.local
-.env.*.local
+.env.*
+!.env.example
+*.pem
+*.key
+/.cursor/mcp.json
+/.mcp.json
+/example-config.local.json
 ecosystem.config.cjs
+
+# Local state/archives (use volumes in production)
+/data/
+/images/
+/archives/
+/backups/
+.vibe-cache/
 
 # Logs
 *.log

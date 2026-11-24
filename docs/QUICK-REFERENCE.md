@@ -1,227 +1,48 @@
-# NovelAI MCP Server - 快速参考
+# 工具和图片速查
 
-## 🚀 启动命令
+接入地址是 `https://api.chiyotobi.party/mcp/mcp`，传输方式为 Streamable HTTP。每次请求均不带 `Authorization` 是匿名模式；每次请求均带 `Authorization: Bearer USER_API_KEY` 是个人密钥模式。换密钥或模式后新建会话。具体参数以该会话的 `tools/list` schema 为准。
 
-```bash
-# Stdio 模式（Claude Desktop）
-npm run start:stdio
+| 工具 | 匿名 | 个人 | 输入 / 返回 |
+|---|:---:|:---:|---|
+| `get_nai_prompt` | ✓ | ✓ | 无参数 `{}`，返回完整提示词模板；首次生图或重绘前先调用 |
+| `generate_image` | ✓ | ✓ | 传 `base_prompt` 文生图，`model` 默认 V5 Full；`n_samples` 固定为 1 |
+| `img2img` | — | ✓ | 用 `source_image`、`base_prompt` 重绘；`strength` 调整改动幅度 |
+| `inpaint_image` | — | ✓ | 源图、提示词加 `mask_image` 或 `mask_regions`；不要传 Vibe 参考 |
+| `augment_image` | — | ✓ | `source_image` 加 `req_type`，如线稿、着色或去背景 |
+| `upscale_image` | — | ✓ | 放大源图；默认先将过大输入等比缩到 1,048,576 像素以内 |
+| `encode_vibe` | — | ✓ | 为 V4.5 编码风格参考，返回可在相同模型中复用的 `vibe_id`；它不是图片 ID |
+| `suggest_tags` | — | ✓ | 根据 `prompt` 片段建议标签；支持 `en`、`jp` |
+| `get_subscription` | — | ✓ | 查询上游 `/v1/usage`，返回当前个人密钥的余额/用量中文摘要及完整原始 JSON。计费单位和扣费规则以上游为准 |
 
-# Streamable HTTP 模式（LobeChat/Dify 推荐）
-npm run start:http
+## 第一次调用
 
-# SSE 模式（备选）
-npm run start:sse
+1. 调用 `get_nai_prompt`，参数 `{}`。模板是随服务交付的完整 [`prompts/novelAI_prompt.md`](../prompts/novelAI_prompt.md)，不是另一个服务或网页。
+2. 按模板组织 `base_prompt`。下面仅演示 `generate_image` 的参数形状，两种模式都可用：
 
-# 自定义端口
-PORT=8080 npm run start:http
+   ```json
+   {
+     "base_prompt": "coastal lighthouse, ocean, dawn, watercolor",
+     "model": "nai-diffusion-5-full",
+     "width": 1024,
+     "height": 1024,
+     "steps": 23,
+     "n_samples": 1
+   }
+   ```
 
-# 使用代理
-HTTPS_PROXY="http://proxy:8080" npm run start:http
-```
+3. 将返回的原图和标注的下载链接展示给用户。需要长期保存时下载原图；默认 300 秒后链接和 ID 不再可读。若原图已返回但保存短链失败，不要自动重试生成，以免重复扣费。
 
-## 🔗 HTTP 端点
+## 模型和免费额度
 
-### Streamable HTTP 模式（推荐）
-| 端点 | 用途 |
-|------|------|
-| `http://localhost:3000/mcp` | MCP 端点（配置到客户端） |
-| `http://localhost:3000/health` | 健康检查 |
+- V5：`nai-diffusion-5-full`（无参考时默认）、`nai-diffusion-5-curated`。V5 支持透明背景，不支持 Vibe 或精确参考。
+- V4.5：`nai-diffusion-4-5-full`、`nai-diffusion-4-5-curated`。付费请求可选择精确参考或 Vibe 参考，不能混用。使用参考时建议显式指定模型。
+- 匿名仅限纯文生图。一张图的宽、高均须是 64 的正整数倍，总像素不超过 1,048,576，步数不超过 28。不要传参考字段，空数组也不行。
+- 所有匿名用户共用过去 5 小时的两池：V4.5 合计 400 张、V5 合计 100 张。并发调用先预占，失败回滚；数据卷保留时重启不重置。达到限额请等最早一笔移出窗口或切换个人密钥，不要不断重试。
 
-### SSE 模式（备选）
-| 端点 | 用途 |
-|------|------|
-| `http://localhost:3000/sse` | SSE 连接（配置到客户端） |
-| `http://localhost:3000/message` | 消息发送 |
-| `http://localhost:3000/health` | 健康检查 |
+## 图片输入和下载
 
-## ⚙️ 环境变量
+付费工具的 `source_image` 等图像参数接受有效期内的 **43 位 `image_id`**、本站原始短链、公网 HTTPS 图片直链、Base64 或 `data:image/...;base64,...`。不能传服务器文件路径、`file:` URL 或私网下载地址。用图像 ID 做下一步处理不必把大图上传第二次。
 
-| 变量 | 必需 | 默认值 | 说明 |
-|------|------|--------|------|
-| `NOVELAI_API_KEY` | ✅ | - | NovelAI API 密钥 |
-| `PORT` | ❌ | 3000 | HTTP 服务器端口（仅 HTTP 模式） |
-| `HTTPS_PROXY` | ❌ | - | HTTPS 代理地址（如 http://proxy:8080） |
-| `HTTP_PROXY` | ❌ | - | HTTP 代理地址 |
+公网图片路径为 `/mcp/novelai-images/{image_id}.{ext}`（`ext` 为 `png`、`webp` 或 `jpg`，应使用回执里的实际扩展名）。归档到期后，知道 ID 或还有链接都不能重新读取；保留命名卷不会延长 TTL。服务端的额度和 Vibe 缓存与这些短期图片分卷保存。
 
-## 🎨 工具参数速查
-
-### base_prompt（必需）
-全局场景和风格
-```
-示例: "masterpiece, best quality, cherry blossoms, sunset"
-```
-
-### base_negative_prompt（可选）
-全局负面词（留空使用默认）
-```
-默认: "lowres, bad anatomy, bad hands, text, error..."
-```
-
-### characters（重要！）
-单人多人都要用
-```json
-// 单人
-[{
-  "prompt": "1girl, blue hair, school uniform",
-  "negative_prompt": "",
-  "center_x": 0.5,
-  "center_y": 0.5
-}]
-
-// 双人
-[
-  { "prompt": "1girl, blue hair", "center_x": 0.3 },
-  { "prompt": "1boy, red hair", "center_x": 0.7 }
-]
-```
-
-### width / height
-必须是 64 的倍数
-```
-竖图: 832 x 1216
-横图: 1216 x 832
-方图: 1024 x 1024
-```
-
-### steps
-锁定 28（免费限制）
-
-## 📍 角色位置速查
-
-```
-水平 (center_x):
-├─ 0.0  最左
-├─ 0.3  左侧
-├─ 0.5  居中 ✨
-├─ 0.7  右侧
-└─ 1.0  最右
-
-垂直 (center_y):
-├─ 0.0  最上
-├─ 0.4  稍上（肖像推荐）
-├─ 0.5  居中 ✨
-├─ 0.7  稍下
-└─ 1.0  最下
-```
-
-## 🧪 快速测试
-
-```bash
-# 1. 健康检查
-curl http://localhost:3000/health
-
-# 2. 自动化测试
-npm install eventsource
-npm run test:http
-
-# 3. 查看日志
-# 服务器会实时输出连接和生成日志
-```
-
-## 🐳 Docker 一键部署
-
-```bash
-# 创建 Dockerfile
-cat > Dockerfile << 'EOF'
-FROM node:20-alpine
-WORKDIR /app
-COPY package*.json ./
-RUN npm install
-COPY . .
-RUN npm run build
-EXPOSE 3000
-CMD ["npm", "run", "start:http"]
-EOF
-
-# 构建运行
-docker build -t novelai-mcp .
-docker run -d -p 3000:3000 -e NOVELAI_API_KEY="your-key" novelai-mcp
-```
-
-## 🔧 常用场景配置
-
-### LobeChat
-```json
-{
-  "url": "http://localhost:3000/sse",
-  "transport": "sse"
-}
-```
-
-### Dify
-- 类型: MCP Server
-- 传输: HTTP (SSE)
-- URL: `http://localhost:3000/sse`
-
-### Claude Desktop（原有）
-```json
-{
-  "mcpServers": {
-    "novelai": {
-      "command": "node",
-      "args": ["D:/WorkSpace/ClaudeCode/NovelAI_MCP/dist/index.js"],
-      "env": { "NOVELAI_API_KEY": "your-key" }
-    }
-  }
-}
-```
-
-## 📊 模式对比
-
-| 特性 | Stdio | HTTP SSE |
-|------|-------|----------|
-| Claude Desktop | ✅ | ❌ |
-| LobeChat | ❌ | ✅ |
-| Dify | ❌ | ✅ |
-| 远程访问 | ❌ | ✅ |
-| 多客户端 | ❌ | ✅ |
-| Docker 部署 | ❌ | ✅ |
-
-## 🆘 故障排查
-
-### 端口被占用
-```bash
-# Windows
-netstat -ano | findstr :3000
-taskkill /PID <PID> /F
-
-# Linux/Mac
-lsof -i :3000
-kill -9 <PID>
-
-# 或使用其他端口
-PORT=8080 npm run start:http
-```
-
-### API 密钥错误
-```bash
-# 检查环境变量
-echo $NOVELAI_API_KEY  # Linux/Mac
-echo %NOVELAI_API_KEY%  # Windows CMD
-$env:NOVELAI_API_KEY   # Windows PowerShell
-```
-
-### 连接超时
-1. 检查服务器是否运行: `curl http://localhost:3000/health`
-2. 检查防火墙设置
-3. 查看服务器日志
-
-## 📖 完整文档
-
-- 快速开始: [QUICKSTART-HTTP.md](./QUICKSTART-HTTP.md)
-- HTTP 详细: [HTTP-MODE.md](./HTTP-MODE.md)
-- 功能总结: [SUMMARY.md](./SUMMARY.md)
-- 使用示例: [EXAMPLES.md](./EXAMPLES.md)
-- 多角色: [CHARACTER-EXAMPLES.md](./CHARACTER-EXAMPLES.md)
-
-## 💡 提示
-
-1. ✅ 工具描述已优化为中文，AI 更准确调用
-2. ✅ characters 参数单人多人都要用
-3. ✅ negative_prompt 会叠加，不是替换
-4. ✅ steps 锁定 28，不要修改
-5. ✅ HTTP 模式支持并发，可多客户端同时使用
-
----
-
-**需要帮助？** 查看对应文档或提交 Issue
+[五种客户端的完整配置](../README.md) · [运行、反代与回滚](QUICKSTART-HTTP.md)

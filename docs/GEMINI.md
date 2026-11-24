@@ -1,31 +1,15 @@
-# 在 Gemini App 使用 NovelAI MCP
+# 在其他 Streamable HTTP 客户端接入
 
-1. 在 Gemini 网页打开「设置 → 关联的应用 → 自定义 → Cloud MCP」。
-2. 粘贴 NovelAI MCP 的完整公网 HTTPS 地址，点击「下一步」并按提示完成连接。当前部署的专用链接已保存在服务器的受限文件中。高级设置的 OAuth 客户端 ID 和密钥留空，NovelAI API 密钥由 MCP 服务端管理。给服务额外配置 OAuth 时，才按服务端的注册方式填高级设置。
-3. 在 Gemini 对话里输入 `@`，选择刚连上的自定义应用，再输入「请用 NovelAI 生成一张月光森林插画」。新建连接在 Gemini 网页完成，连接后的应用可在网页和手机端使用。
+如果你的 Gemini 或其他客户端支持自定义远程 MCP 服务，先确认它支持 **Streamable HTTP** 以及你要用的鉴权方式。以下只涉及协议配置，不假定某个版本或账号一定有该入口。
 
-[Google 官方接入步骤](https://support.google.com/gemini/answer/17209137)
+| 客户端能力 | 如何配置 |
+|---|---|
+| 可以填写服务 URL | 填 `https://api.chiyotobi.party/mcp/mcp`，不是图片基址或健康检查地址 |
+| 只能填写 URL，不能附带自定义请求头 | 使用匿名体验。不要把密钥附在域名、路径或查询参数里 |
+| 可以为每次请求添加 HTTP header | 个人密钥模式填写 `Authorization: Bearer USER_API_KEY`；匿名模式完全不发送该头 |
 
-默认模型为 V5 Curated。可以在提示中明确指定 V5 Full 或 V4.5 Full。V5 有独立的额度规则。[NovelAI 官方模型说明](https://docs.novelai.net/en/image/models)
+初始化后刷新工具列表。匿名只应出现 `get_nai_prompt` 和 `generate_image`；个人密钥模式有 9 个工具。切换密钥或模式时重新初始化会话。先让助手用 `{}` 调用 `get_nai_prompt` 读取完整模板，再提出绘图要求。
 
-自行部署时，将带访问保护的公网 HTTPS 入口反代到服务的 `/mcp`，并关闭反代缓冲以支持 Streamable HTTP。专用访问链接应按访问凭据保管。支持 MCP 的其他客户端也可以使用 Streamable HTTP 接入。
+生成结果包含原图；客户端没有显示内嵌图片时，请从回执打开下载链接并在默认的 5 分钟内保存。链接和 43 位 `image_id` 都不是永久存储，谁持有未过期的图片链接就可能读取图片。不要把真实链接、密钥或回执贴到公开日志。
 
-[Google 开发者接入文档](https://developers.google.com/connected-apps/mcp)
-
-## 上传参考图
-
-登录 NovelAI 画廊，在「画廊图库」点「上传参考图」。选择本地文件，或把剪贴板中的图像粘贴到上传窗口。支持 PNG、JPEG 和 WebP，单张最大 20 MiB。上传保留原图，可以在画廊里查看、下载和删除。
-
-复制上传结果中的归档 ID，贴到 Gemini，说明用它做图生图或角色参考。MCP 分别把 ID 作为 `source_image` 或 `character_references[].image` 读取。持有有效 MCP 链接和归档 ID 的调用方可以使用该图。上传的参考图只在管理台列出。
-
-## 图片回执
-
-公网部署的工具回执同时包含原生 PNG 和「查看或下载图片」的文本链接。Gemini 若没有内嵌图片，可以打开回执中的链接。归档链接没有有效期，服务重启后仍可使用。链接应按图片访问凭据保管。
-
-自建部署可将 `MCP_IMAGE_PUBLIC_ORIGIN` 设为公网 HTTPS 域名，将该域名的 `/novelai-images/` 原路径代理到 Streamable HTTP 服务。开放 GET 和 HEAD 即可。使用 `MCP_IMAGE_ARCHIVE_DIR` 指定持久化卷或目录。仅设置归档目录时会保存 PNG，工具回执继续返回原生图片。
-
-## 图库读取格式
-
-归档根目录下，每张图片对应一个随机 ID 目录，包含 `image.png` 与 `metadata.json`。元数据版本为 `schema_version: 1`，包含图片 ID、UTC 生成时间、模型、宽高、随机种子、媒体类型和字节数。忽略以点开头的未提交目录。图库可从服务器文件系统按需读取。公网无需目录索引，只有持有对应图片链接的访问方可以下载该图。归档由运维管理，无自动到期删除。
-
-[Google 工具回执优化说明](https://developers.google.com/connected-apps/mcp/server-optimization)
+Cursor、Cherry Studio、AstrBot、Claude Code 与 Codex 的完整示例见[中文 README](../README.md) 或 [English README](../README.en.md)。

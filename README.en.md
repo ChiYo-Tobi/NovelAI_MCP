@@ -1,268 +1,142 @@
-# NovelAI MCP Server
+# Qiandai API · NovelAI MCP
 
-<div align="center">
+[简体中文](README.md) | [Operations guide (中文)](docs/QUICKSTART-HTTP.md) | [Tool reference (中文)](docs/QUICK-REFERENCE.md)
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](https://opensource.org/licenses/MIT)
-[![TypeScript](https://img.shields.io/badge/TypeScript-5.7-blue.svg)](https://www.typescriptlang.org/)
-[![Node](https://img.shields.io/badge/Node-20+-green.svg)](https://nodejs.org/)
-[![MCP](https://img.shields.io/badge/MCP-1.0-purple.svg)](https://modelcontextprotocol.io/)
+Add **`https://api.chiyotobi.party/mcp/mcp`** to a **Streamable HTTP** MCP client. The first `/mcp` is the reverse proxy prefix; the second is the protocol endpoint. You do not need Node.js or Docker to use the hosted service.
 
-**A full-featured Model Context Protocol (MCP) server for NovelAI image generation API**
+## Choose an access mode
 
-English | [简体中文](./README.md)
+| | Anonymous (omit Authorization) | Personal API key (paid) |
+|---|---|---|
+| Tools listed and callable | Only 2: `get_nai_prompt` and `generate_image` | All 9: the free pair plus `img2img`, `inpaint_image`, `augment_image`, `upscale_image`, `encode_vibe`, `suggest_tags` and `get_subscription` |
+| Usage charged to | A server-side default credential; all anonymous users share the free pools | Your `USER_API_KEY` at the upstream service, not the free pools |
+| Generation limits | One image; width and height must each be multiples of 64, width × height ≤ 1,048,576, steps ≤ 28. No image, precise or Vibe references | Tool and model input constraints still apply; the upstream service determines charges |
 
-</div>
+The **rolling five-hour window** counts V4.5 Full and Curated **together, up to 400 images**, and V5 Full and Curated **together, up to 100 images**. These are not separate allowances per user or model. A free request reserves a slot on disk before generation; a failed generation rolls back its reservation. Restarting with the same data volume does not reset usage. An invalid personal key does not fall back to the server's credential.
 
----
+There are four models. **V5 Full** is the default for generation without references. For a paid request using precise or Vibe references, select the corresponding V4.5 model. Text-to-image generation returns one image in both modes (`n_samples` is fixed at 1).
 
-## ✨ Features
+| Family | Full | Curated |
+|---|---|---|
+| V5 | `nai-diffusion-5-full` (default) | `nai-diffusion-5-curated` |
+| V4.5 | `nai-diffusion-4-5-full` | `nai-diffusion-4-5-curated` |
 
-- 🎨 **Latest Model Support** - Full support for NAI Diffusion V4.5 Full
-- 🚀 **Dual Transport Modes** - Stdio (Claude Desktop) and HTTP SSE (LobeChat/Dify)
-- 🎭 **Multi-Character Support** - V4+ character positioning with individual prompts
-- ⚡ **Advanced Sampling** - 7 samplers, 4 noise schedules, Brownian noise
-- 🎛️ **Full Parameter Control** - All NovelAI API parameters configurable
-- 📝 **Optimized Descriptions** - Tool descriptions in Chinese for better AI recognition
-- 🔧 **Flexible Deployment** - Local or Docker container
-- 📚 **Comprehensive Docs** - Detailed examples and best practices
+**Get the template before the first generation or edit.** Ask your assistant to call `get_nai_prompt` with `{}`, read the complete bundled [`prompts/novelAI_prompt.md`](prompts/novelAI_prompt.md), then compose the prompt. For example: “Get the template first, then draw a coastal lighthouse at 1024 × 1024 using the default model and no references.”
 
-## 📦 Quick Start
+Image results include **the original image, a 43-character `image_id`, and a short link valid for five minutes (300 seconds) by default**. If the client does not render the image, open the link and save the original before expiry. Paid tools that take images can use the ID while the image is available. Do not treat IDs or short links as a permanent gallery or share them publicly. `get_subscription` queries upstream `/v1/usage` with your key and returns a Chinese balance/usage summary alongside the **complete original JSON**. The upstream service defines units, pricing and final charges.
 
-### Installation
+## Client configuration
 
-```bash
-# Clone repository
-git clone https://github.com/SGSxingchen/NovelAI_MCP.git
-cd NovelAI_MCP
+The examples below use a personal key. Replace `USER_API_KEY` only in your own client; it sends `Authorization: Bearer …` with each MCP request, including reconnects. **For anonymous access omit the entire `headers` field or the CLI authentication flag.** Do not send an empty Bearer header or put keys in URLs, shared configs, screenshots or source control.
 
-# Install dependencies
-npm install
+### Cursor
 
-# Build
-npm run build
-```
-
-### Configuration
-
-#### Option 1: Stdio Mode (Claude Desktop)
-
-Add to Claude Desktop config:
+Merge the entry into your MCP configuration; see also [example-config.json](example-config.json).
 
 ```json
 {
   "mcpServers": {
-    "novelai": {
-      "command": "node",
-      "args": ["path/to/project/dist/index.js"],
-      "env": {
-        "NOVELAI_API_KEY": "your-api-key-here"
-      }
+    "qiandai-api-mcp": {
+      "url": "https://api.chiyotobi.party/mcp/mcp",
+      "headers": { "Authorization": "Bearer USER_API_KEY" }
     }
   }
 }
 ```
 
-#### Option 2: Streamable HTTP Mode (LobeChat/Dify Recommended)
+### Cherry Studio
 
-**Linux/Mac:**
-```bash
-export NOVELAI_API_KEY="your-api-key"
-export HTTPS_PROXY="http://127.0.0.1:7890"  # Optional: Set proxy
-npm run start:http
-```
-
-**Windows PowerShell:**
-```powershell
-$env:NOVELAI_API_KEY="your-api-key"
-$env:HTTPS_PROXY="http://127.0.0.1:7890"  # Optional: Set proxy
-npm run start:http
-```
-
-**Windows CMD:**
-```cmd
-set NOVELAI_API_KEY=your-api-key
-set HTTPS_PROXY=http://127.0.0.1:7890
-npm run start:http
-```
-
-Configure in client:
-- **URL**: `http://localhost:3000/mcp`
-- **Transport**: Streamable HTTP
-
-#### Option 3: SSE Mode (Alternative)
-
-**Linux/Mac:**
-```bash
-export NOVELAI_API_KEY="your-api-key"
-export HTTPS_PROXY="http://127.0.0.1:7890"  # Optional
-npm run start:sse
-```
-
-**Windows PowerShell:**
-```powershell
-$env:NOVELAI_API_KEY="your-api-key"
-$env:HTTPS_PROXY="http://127.0.0.1:7890"
-npm run start:sse
-```
-
-**Windows CMD:**
-```cmd
-set NOVELAI_API_KEY=your-api-key
-set HTTPS_PROXY=http://127.0.0.1:7890
-npm run start:sse
-```
-
-Configure in client:
-- **URL**: `http://localhost:3000/sse`
-- **Transport**: Server-Sent Events (SSE)
-
-## 🎯 Supported Models
-
-Current version focuses on the latest NovelAI V4.5 model:
-
-| Model | Description |
-|------|------|
-| `nai-diffusion-4-5-full` | NAI Diffusion V4.5 Full (Only supported model) |
-
-> **Note**: This project is specifically optimized for V4.5 Full with complete feature support (Auto SMEA, Brownian noise, multi-character positioning, etc.). For other models, please refer to earlier versions or submit an Issue.
-
-## 💡 Usage Examples
-
-### Basic Text-to-Image
-
-```typescript
-// AI will automatically call the tool, just describe naturally
-"Draw a blue-haired anime girl in school uniform under cherry blossoms"
-```
-
-AI generates parameters like:
 ```json
 {
-  "base_prompt": "masterpiece, best quality, cherry blossoms, detailed",
-  "characters": [{
-    "prompt": "1girl, blue hair, school uniform, beautiful eyes",
-    "negative_prompt": "",
-    "center_x": 0.5,
-    "center_y": 0.5
-  }],
-  "width": 832,
-  "height": 1216
+  "mcpServers": {
+    "qiandai-api-mcp": {
+      "name": "qiandai-api-mcp",
+      "type": "streamableHttp",
+      "baseUrl": "https://api.chiyotobi.party/mcp/mcp",
+      "headers": { "Authorization": "Bearer USER_API_KEY" },
+      "timeout": 600
+    }
+  }
 }
 ```
 
-### Multi-Character Scenes
+### AstrBot
 
-```typescript
-"Draw two characters talking, blue-haired girl on left reading, red-haired boy on right standing"
+Paste this single object into **Add Server**, without a `mcpServers` wrapper:
+
+```json
+{
+  "transport": "streamable_http",
+  "url": "https://api.chiyotobi.party/mcp/mcp",
+  "headers": { "Authorization": "Bearer USER_API_KEY" },
+  "timeout": 30,
+  "sse_read_timeout": 300
+}
 ```
 
-See [Examples Documentation](./docs/EXAMPLES.md) for more.
+### Claude Code
 
-## 🔧 Core Parameters
-
-| Parameter | Type | Description |
-|-----------|------|-------------|
-| `base_prompt` | string | Global scene and style description |
-| `base_negative_prompt` | string | Global negative prompt |
-| `characters` | array | Character array (required for both single/multi) |
-| `width` / `height` | number | Image size (must be multiple of 64) |
-| `steps` | number | Sampling steps (locked to 28, free tier limit) |
-
-See [Quick Reference](./docs/QUICK-REFERENCE.md) for complete parameter list.
-
-## 📊 Transport Mode Comparison
-
-| Feature | Stdio Mode | Streamable HTTP | SSE Mode |
-|---------|-----------|----------------|----------|
-| **Use Case** | Claude Desktop | LobeChat, Dify (Recommended) | SSE Clients |
-| **Protocol** | MCP Stdio | MCP Streamable HTTP | MCP SSE Transport |
-| **Endpoint** | - | `/mcp` | `/sse` + `/message` |
-| **Remote Access** | ❌ | ✅ | ✅ |
-| **Multi-Client** | ❌ | ✅ | ✅ |
-| **Proxy Support** | ❌ | ✅ | ✅ |
-| **Start Command** | `npm run start:stdio` | `npm run start:http` | `npm run start:sse` |
-
-## 🌍 Environment Variables
-
-| Variable | Required | Default | Description |
-|----------|----------|---------|-------------|
-| `NOVELAI_API_KEY` | ✅ | - | NovelAI API key |
-| `PORT` | ❌ | 3000 | HTTP server port (HTTP modes only) |
-| `HTTPS_PROXY` | ❌ | - | HTTPS proxy address |
-| `HTTP_PROXY` | ❌ | - | HTTP proxy address |
-
-## 📚 Documentation
-
-- 🚀 [HTTP Quick Start](./docs/QUICKSTART-HTTP.md)
-- 🎨 [Usage Examples](./docs/EXAMPLES.md)
-- 🎭 [Multi-Character Feature](./docs/CHARACTER-EXAMPLES.md)
-- 📋 [Quick Reference Card](./docs/QUICK-REFERENCE.md)
-- 📝 [Complete Feature Summary](./SUMMARY.md)
-- 📜 [Changelog](./CHANGELOG.md)
-
-## 🛠️ Development
-
-```bash
-# Clone repository
-git clone https://github.com/SGSxingchen/NovelAI_MCP.git
-cd NovelAI_MCP
-
-# Install dependencies
-npm install
-
-# Build
-npm run build
-
-# Development mode
-npm run dev
-
-# Start HTTP server
-npm run start:http
+```sh
+claude mcp add --transport http qiandai-api-mcp https://api.chiyotobi.party/mcp/mcp --header "Authorization: Bearer USER_API_KEY"
 ```
 
-## 🐳 Docker Deployment (Optional)
+Anonymous (omit `--header`):
 
-Dockerfile is included if you want to build it yourself:
-
-```bash
-# Build image
-docker build -t novelai-mcp-server .
-
-# Run container
-docker run -d \
-  -p 3000:3000 \
-  -e NOVELAI_API_KEY="your-api-key" \
-  --name novelai-mcp \
-  novelai-mcp-server
+```sh
+claude mcp add --transport http qiandai-api-mcp https://api.chiyotobi.party/mcp/mcp
 ```
 
-## 🤝 Contributing
+### Codex
 
-Contributions welcome! See [CONTRIBUTING.md](./CONTRIBUTING.md).
+Set the key in the **environment that runs Codex**. Use the command for your shell; keep actual secrets out of shared shell histories.
 
-## 📄 License
+```sh
+# Linux / macOS / POSIX shell
+export QIANDAI_MCP_API_KEY='USER_API_KEY'
+```
 
-This project is licensed under the MIT License - see [LICENSE](LICENSE) for details.
+```powershell
+# Windows PowerShell
+$env:QIANDAI_MCP_API_KEY = 'USER_API_KEY'
+```
 
-## 🙏 Acknowledgments
+```cmd
+:: Windows cmd.exe
+set "QIANDAI_MCP_API_KEY=USER_API_KEY"
+```
 
-- [NovelAI](https://novelai.net/) - Powerful image generation API
-- [Model Context Protocol](https://modelcontextprotocol.io/) - MCP specification
-- [Anthropic](https://www.anthropic.com/) - MCP SDK and Claude
+```sh
+codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp --bearer-token-env-var QIANDAI_MCP_API_KEY
+```
 
-## 🔗 Links
+Anonymous access requires neither the environment variable nor `--bearer-token-env-var`:
 
-- [NovelAI Official](https://novelai.net/)
-- [NovelAI API Docs](https://api.novelai.net/docs/)
-- [MCP Documentation](https://modelcontextprotocol.io/)
-- [Issue Tracker](https://github.com/SGSxingchen/NovelAI_MCP/issues)
+```sh
+codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp
+```
 
----
+Reconnect and refresh the tool list after switching modes. Expect 2 tools without credentials and 9 with a personal key.
 
-<div align="center">
+## Self-hosting
 
-**If this project helps you, please give it a ⭐️!**
+Use the supplied [Compose file](docker-compose.yml) and [Dockerfile](Dockerfile). The multi-stage Node 24 Debian image includes the platform-specific `sharp` dependencies and the full prompt template. The service runs as the non-root `node` user.
 
-Made with ❤️ by the community
+1. Copy [.env.example](.env.example) to an untracked, service-specific `.env`. Set `DEFAULT_NOVELAI_API_KEY` there and set `MCP_DOCKER_NETWORK` to the name of the **existing private network** containing the upstream. Never give the default server key to a client.
+2. Check that `qiandaiapi-app` resolves on that network. Run `docker compose config --quiet`, then `docker compose up -d --build --wait novelai-mcp`. Compose runs a single instance with `restart: unless-stopped`.
+3. From the host, run `curl -fsS http://127.0.0.1:13000/health` for process health. The container listens on `0.0.0.0:3000`; use `novelai-mcp:3000` from a proxy on its private network, or `127.0.0.1:${MCP_HOST_PORT:-13000}` from a host proxy. Do not publish the container port publicly.
 
-</div>
+| Compose setting | Default / purpose |
+|---|---|
+| `UPSTREAM_BASE_URL` | `http://qiandaiapi-app:8080` on the existing private network |
+| `MCP_ALLOWED_ORIGINS` | `*`; may be restricted to a comma-separated list of origins. CORS is not authentication |
+| `MCP_IMAGE_PUBLIC_BASE_URL` | `https://api.chiyotobi.party/mcp`, including the proxy prefix but not the protocol endpoint |
+| `MCP_IMAGE_TTL_SECONDS` | `300`, the short link lifetime in seconds |
+| `PORT` / `MCP_HOST_PORT` | Fixed `3000` in the container / loopback `13000` on the host by default |
+| `MCP_DATA_DIR` | Volume `novelai-mcp-data` → `/var/lib/novelai-mcp/data`, for quota and the Vibe cache |
+| `MCP_IMAGE_ARCHIVE_DIR` | Separate volume `novelai-mcp-images` → `/var/lib/novelai-mcp/images`, for temporary images |
+
+The [Caddy route](deploy/caddy-route.caddy) strips the outer `/mcp` **once**: public `/mcp/health` maps to `/health`, and `/mcp/mcp` maps to `/mcp`. Preserve authorization and MCP session headers and disable buffering. A containerized proxy on the same network needs no host port mapping. Before an upgrade, retain the working image tag, drain requests, and back up both volumes and the proxy configuration. Replace the single instance; never let the old and new process write to the same volumes at once. To roll back, keep traffic drained, select the previous image/config and compatible volumes, then check health and the anonymous tool list before reopening traffic. See the [runbook](docs/QUICKSTART-HTTP.md) for the proxy configuration and rollback commands.
+
+For local development, use Node.js 24 and run `npm ci`, `npm run build`, then `npm test` in the project root. To try the service, use a dedicated `.env` pointing at a reachable test upstream and set `MCP_BIND_HOST=127.0.0.1`. Run `npm run start:http`; the local MCP endpoint is `http://127.0.0.1:3000/mcp`.
+
+[Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)

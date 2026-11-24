@@ -1,64 +1,23 @@
 # 贡献指南
 
-感谢你考虑为 NovelAI MCP Server 做出贡献！
+本服务只接受 Streamable HTTP。改动前请先区分两个边界：客户端使用自己的 `Authorization: Bearer USER_API_KEY`；匿名请求使用服务端注入的默认凭据。两者不共享个人密钥、工具权限或计费记录。
 
-## 报告问题
+## 本地开发
 
-发现 bug 或有功能建议？请在 [Issues](../../issues) 中提交。
+使用 Node.js 24、npm 和仓库中的锁文件。在项目根目录执行：
 
-提交 Issue 时请包含：
-- 清晰的标题和描述
-- 复现步骤（如果是 bug）
-- 系统环境（Node 版本、操作系统等）
+```sh
+npm ci
+npm run build
+npm test
+```
 
-## 提交代码
+构建会清理旧 `dist/` 并按 `tsconfig.json` 编译。测试应使用临时数据目录和模拟上游，不能依赖线上服务、真实账户或付费生成。需要试运行时，向进程提供本地测试配置，再执行 `npm run start:http`。不要把开发实例接入生产网络、数据卷或域名。
 
-1. **Fork 并克隆项目**
-   ```bash
-   git clone https://github.com/SGSxingchen/NovelAI_MCP.git
-   cd NovelAI_MCP
-   ```
+## 提交前核对
 
-2. **创建分支**
-   ```bash
-   git checkout -b feature/your-feature-name
-   ```
-
-3. **开发和测试**
-   ```bash
-   npm install
-   npm run build
-   npm run start:http  # 测试 HTTP 模式
-   ```
-
-4. **提交更改**
-   ```bash
-   git add .
-   git commit -m "feat: 描述你的更改"
-   ```
-
-   提交信息格式：
-   - `feat:` 添加新功能
-   - `fix:` 修复 bug
-   - `docs:` 更新文档
-   - `refactor:` 重构代码
-
-5. **推送并创建 Pull Request**
-   ```bash
-   git push origin feature/your-feature-name
-   ```
-
-## 代码规范
-
-- 使用 TypeScript
-- 保持代码简洁
-- 添加必要的注释
-
-## 更新文档
-
-如果你的更改影响用户使用，请同步更新：
-- README.md
-- 相关文档（docs/ 目录）
-- CHANGELOG.md
-
-感谢你的贡献！🎉
+- 改动权限或工具时，同时验证匿名和个人密钥两种 `tools/list` **及** `tools/call`；无效的个人密钥不能借用服务端凭据。
+- 改动免费额度时，覆盖同代两模型共享、并发预占、失败回滚、滑动窗口和保留数据目录后的重启；不要用多个服务进程写同一份账本。
+- 改动图片或提示词时，验证返回的是原图、43 位 ID、带前缀的限时链接，以及从成品镜像可读取的完整 `prompts/novelAI_prompt.md`。
+- 改动交付契约时，同步更新中英文 README、[运维手册](docs/QUICKSTART-HTTP.md)、示例配置及相关测试。锁文件必须与清单一致；变更原生依赖后在目标平台验证 Node 24 能加载 `sharp`。
+- Issue/PR 中给出操作系统、Node 版本、脱敏后的步骤与实际/期望结果。不要附 `.env`、Authorization、会话标识、图片 ID/短链、用户图片、原始余额明细或未经审查的日志；不要改写已经发布的历史记录。

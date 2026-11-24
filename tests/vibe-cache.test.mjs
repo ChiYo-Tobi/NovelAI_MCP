@@ -1,9 +1,11 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
 import { createHash } from 'node:crypto';
-import { mkdtemp, readFile, rm, stat, writeFile } from 'node:fs/promises';
+import { mkdir, mkdtemp, readFile, readdir, rm, stat, symlink, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
+import sharp from 'sharp';
+import { cleanupExpiredImages, saveArchivedImage } from '../dist/image-archive.js';
 import { VibeCache, vibeCacheKey } from '../dist/vibe-cache.js';
 
 const model = 'nai-diffusion-4-5-full';
@@ -20,10 +22,11 @@ test('Vibe 键使用原始图片字节、模型、四位提取比例和遮罩摘
   assert.notEqual(vibeCacheKey(image, model, 0.12346), expected);
 });
 
-test('并发编码去重，缓存文件跨实例读取，列表省略二进制数据', async t => {
-  const archiveDir = await mkdtemp(join(tmpdir(), 'nai-vibe-test-'));
-  t.after(() => rm(archiveDir, { recursive: true, force: true }));
-  const cache = new VibeCache(archiveDir);
+test('并发编码去重；Vibe 在 dataDir 持久化，不依赖图像归档', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nai-vibe-test-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const cache = new VibeCache(dataDir);
   const key = vibeCacheKey(image, model, 0.5);
   let encodes = 0;
   const encode = async () => {
@@ -38,21 +41,49 @@ test('并发编码去重，缓存文件跨实例读取，列表省略二进制�
   assert.deepEqual(first, second);
   assert.equal(first.id, `vibe_${key.slice(0, 16)}`);
   assert.equal(first.encoded_vibe, encoded);
-  const filename = join(archiveDir, '.vibe-cache', `${first.id}.json`);
+  const filename = join(dataDir, '.vibe-cache', `${first.id}.json`);
   if (process.platform !== 'win32') assert.equal((await stat(filename)).mode & 0o777, 0o600);
   assert.deepEqual(JSON.parse(await readFile(filename, 'utf8')), first);
 
-  const restarted = new VibeCache(archiveDir);
+  const archiveDir = join(root, 'images');
+  await mkdir(archiveDir);
+  const png = await sharp({ create: { width: 2, height: 2, channels: 3, background: '#ccbbaa' } }).png().toBuffer();
+  // 即使旧部署把两类数据放在同一目录，过期清理也只接触图片归档。
+  for (const directory of [archiveDir, dataDir]) {
+    const { id } = await saveArchivedImage(directory, png, { tool: 'generate_image', action: 'generate' });
+    await cleanupExpiredImages(directory, 0);
+    await assert.rejects(stat(join(directory, id)), { code: 'ENOENT' });
+  }
+  assert.deepEqual(await readdir(archiveDir), []);
+  assert.deepEqual(await readdir(dataDir), ['.vibe-cache']);
+  const restarted = new VibeCache(dataDir);
   assert.deepEqual(await restarted.getByHashKey(key), first);
   assert.deepEqual(await restarted.getById(first.id), first);
   assert.deepEqual(await restarted.getOrEncode(key, model, 0.5, encode), first);
   assert.equal(encodes, 1);
-  const { encoded_vibe, ...summary } = first;
-  assert.deepEqual(await restarted.list(), [summary]);
   assert.equal(await restarted.getById('../metadata'), undefined);
 
   await writeFile(filename, '{"encoded_vibe": false}');
-  assert.equal(await new VibeCache(archiveDir).getById(first.id), undefined);
+  assert.equal(await new VibeCache(dataDir).getById(first.id), undefined);
+});
+
+test('缓存目录是链接时不跨目录读写，编码仍可从内存按 ID 获取', async t => {
+  const root = await mkdtemp(join(tmpdir(), 'nai-vibe-link-'));
+  t.after(() => rm(root, { recursive: true, force: true }));
+  const dataDir = join(root, 'data');
+  const outside = join(root, 'outside');
+  await Promise.all([mkdir(dataDir), mkdir(outside)]);
+  await symlink(outside, join(dataDir, '.vibe-cache'), process.platform === 'win32' ? 'junction' : 'dir');
+  const key = vibeCacheKey(image, model, 0.5);
+  const id = `vibe_${key.slice(0, 16)}`;
+  const target = join(outside, `${id}.json`);
+  const fixture = JSON.stringify({ id, model, information_extracted: 0.5, encoded_vibe: 'YQ==', created_at: new Date().toISOString() });
+  await writeFile(target, fixture);
+  const cache = new VibeCache(dataDir);
+  assert.equal(await cache.getById(id), undefined);
+  const entry = await cache.set(key, { model, information_extracted: 0.5, encoded_vibe: encoded });
+  assert.equal((await cache.getById(entry.id)).encoded_vibe, encoded);
+  assert.equal(await readFile(target, 'utf8'), fixture);
 });
 
 test('编码失败不缓存，后续请求可以重新编码', async () => {

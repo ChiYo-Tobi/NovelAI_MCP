@@ -1,25 +1,39 @@
 import test from 'node:test';
 import assert from 'node:assert/strict';
-import { mkdtemp, rm, writeFile } from 'node:fs/promises';
+import { mkdtemp, readFile, readdir, rm, writeFile } from 'node:fs/promises';
 import { tmpdir } from 'node:os';
 import { join } from 'node:path';
 import { Client } from '@modelcontextprotocol/sdk/client/index.js';
 import { InMemoryTransport } from '@modelcontextprotocol/sdk/inMemory.js';
 import sharp from 'sharp';
-import { createNovelAIMcpServer, getDisclosureMetrics, PROGRESSIVE_TOOL_COUNT } from '../dist/mcp-tools.js';
+import { createNovelAIMcpServer, TOOL_COUNT } from '../dist/mcp-tools.js';
 import { DEFAULT_MODEL, IMAGE_MODELS } from '../dist/types.js';
-import { renderV5StylistGuide } from '../dist/v5-stylist.js';
 import { VibeCache } from '../dist/vibe-cache.js';
 
+const names = ['generate_image', 'img2img', 'inpaint_image', 'augment_image', 'upscale_image', 'encode_vibe', 'suggest_tags', 'get_subscription', 'get_nai_prompt'];
 const v45 = 'nai-diffusion-4-5-full';
-const v3 = 'nai-diffusion-3';
-const origin = new URL('https://images.example.com');
-const png = await sharp({
-  create: { width: 101, height: 190, channels: 3, background: '#b53022' },
-}).png().toBuffer();
-const encoded = Buffer.from('opaque-v4-vibe').toString('base64');
+const freeOnly = '当前为免费体验模式，仅支持文生图（generate_image）与提示词模板（get_nai_prompt）。请在请求头配置 Authorization: Bearer <您的API_KEY> 解锁全部功能。';
+const imageOrigin = new URL('https://images.example.invalid/gateway/novelai');
+const promptFile = new URL('../prompts/novelAI_prompt.md', import.meta.url);
+const canvas = () => sharp({ create: { width: 101, height: 190, channels: 3, background: '#b53022' } });
+const [png, webp, jpeg, gif] = await Promise.all([canvas().png(), canvas().webp(), canvas().jpeg(), canvas().gif()].map(image => image.toBuffer()));
 const source = `data:image/png;base64,${png.toString('base64')}`;
+const encoded = Buffer.from('opaque-vibe').toString('base64');
+const region = { shape: 'ellipse', x: 0.1, y: 0.2, width: 0.4, height: 0.5 };
+const outputs = {
+  png: { buffer: png, ext: 'png', mimeType: 'image/png', seed: 42 },
+  webp: { buffer: webp, ext: 'webp', mimeType: 'image/webp' },
+  jpg: { buffer: jpeg, ext: 'jpg', mimeType: 'image/jpeg' },
+};
+const generation = (params, image = outputs.png) => ({
+  images: [image], model: params.model, requestedModel: params.model, seed: params.seed ?? 12, rawBuffer: image.buffer,
+});
 
+async function temp(t) {
+  const path = await mkdtemp(join(tmpdir(), 'nai-mcp-tool-'));
+  t.after(() => rm(path, { recursive: true, force: true }));
+  return path;
+}
 async function connect(t, options) {
   const client = new Client({ name: '工具测试', version: '1.0.0' });
   const server = createNovelAIMcpServer(options);
@@ -27,399 +41,336 @@ async function connect(t, options) {
   t.after(async () => { await client.close(); await server.close(); });
   await server.connect(serverSide);
   await client.connect(clientSide);
-  return client;
+  return { client, call: (name, args) => client.callTool({ name, arguments: args }) };
+}
+function success(result) {
+  assert.ok(!result.isError, result.content[0]?.text);
+  return result.content;
+}
+function rejected(result, message) {
+  assert.equal(result.isError, true, result.content[0]?.text);
+  assert.equal(result.content[0].type, 'text');
+  if (message instanceof RegExp) assert.match(result.content[0].text, message);
+  else assert.equal(result.content[0].text, message);
+}
+function imageContent(content, index, image) {
+  assert.deepEqual(content[index], { type: 'image', mimeType: image.mimeType, data: image.buffer.toString('base64') });
+}
+function receiptLink(line, ext) {
+  const match = /image_id ([A-Za-z0-9_-]{43}) · \[查看或下载图片\]\(([^)]+)\)/.exec(line);
+  assert.ok(match, line);
+  const [, id, url] = match;
+  assert.equal(url, `${imageOrigin.href}/novelai-images/${id}.${ext}`);
+  return { id, url };
+}
+// Record even unexpected calls: an assertion thrown inside a mock can otherwise look like a successful rejection.
+function upstream(impl = {}) {
+  const calls = [];
+  const client = Object.fromEntries(['generateImage', 'augmentImage', 'upscaleImage', 'encodeVibe', 'getSubscription', 'suggestTags'].map(name => [name, async (...args) => {
+    calls.push({ name, args });
+    if (!impl[name]) throw new Error(`意外的上游调用：${name}`);
+    return impl[name](...args);
+  }]));
+  return { client, calls };
 }
 
-function testBothModes(name, run) {
-  for (const disclosureMode of ['legacy', 'progressive']) {
-    test(`${name}（${disclosureMode}）`, t => run(t, async options => {
-      const client = await connect(t, { ...options, disclosureMode });
-      return (action, params) => client.callTool(disclosureMode === 'legacy'
-        ? { name: action, arguments: params }
-        : { name: 'nai_execute', arguments: { action, params } });
-    }));
-  }
+for (const mode of ['paid', 'free']) {
+  test(`${mode} 仅公布可执行的工具；提示词原样返回且无上游请求`, async t => {
+    const api = upstream();
+    const { client, call } = await connect(t, { mode, client: api.client });
+    const { tools } = await client.listTools();
+    assert.equal(TOOL_COUNT, 9);
+    assert.deepEqual(tools.map(x => x.name), mode === 'paid' ? names : ['generate_image', 'get_nai_prompt']);
+    const capabilities = client.getServerCapabilities();
+    assert.ok(capabilities.tools);
+    assert.equal(capabilities.prompts, undefined);
+    assert.equal(capabilities.resources, undefined);
+    assert.match(client.getInstructions(), /首次.*先调用 get_nai_prompt/);
+    assert.equal(DEFAULT_MODEL, 'nai-diffusion-5-full');
+    assert.deepEqual([...IMAGE_MODELS].sort(), [DEFAULT_MODEL, 'nai-diffusion-5-curated', v45, 'nai-diffusion-4-5-curated'].sort());
+    for (const definition of tools) {
+      assert.equal(definition.inputSchema.additionalProperties, false, definition.name);
+      if (names.slice(0, 3).includes(definition.name)) {
+        const fields = definition.inputSchema.properties;
+        assert.equal(fields.model.default, DEFAULT_MODEL);
+        assert.deepEqual(fields.model.enum, [...IMAGE_MODELS]);
+        assert.equal(fields.n_samples.const, 1);
+        assert.equal(fields.n_samples.default, 1);
+        assert.match(definition.description, /首次.*先调用 get_nai_prompt/);
+      }
+    }
+    const prompt = tools.find(x => x.name === 'get_nai_prompt');
+    assert.match(prompt.description, /首次.*generate_image.*img2img.*inpaint_image.*先调用/);
+    assert.equal(prompt.annotations.readOnlyHint, true);
+    assert.equal(prompt.annotations.openWorldHint, false);
+    const template = await readFile(promptFile, 'utf8');
+    assert.notEqual(template.trim(), '');
+    assert.deepEqual(success(await call(prompt.name)), [{ type: 'text', text: template }]);
+    rejected(await call(prompt.name, { path: 'other.md' }), /path/);
+    if (mode === 'free') {
+      const fields = tools[0].inputSchema.properties;
+      assert.equal(fields.width.multipleOf, 64);
+      assert.equal(fields.height.multipleOf, 64);
+      assert.equal(fields.steps.maximum, 28);
+      assert.equal(fields.character_references, undefined);
+      assert.equal(fields.vibe_references, undefined);
+      for (const name of [...names.filter(n => n !== 'generate_image' && n !== 'get_nai_prompt'), 'unknown']) {
+        rejected(await call(name, { unexpected: true }), freeOnly);
+      }
+    } else {
+      assert.equal(tools.find(x => x.name === 'inpaint_image').inputSchema.properties.vibe_references, undefined);
+      assert.match(tools.find(x => x.name === 'get_subscription').description, /当前 API Key.*账户余额与用量信息.*\/v1\/usage/);
+      rejected(await call('unknown'), /未知工具/);
+    }
+    assert.deepEqual(api.calls, []);
+  });
 }
 
-function jsonContent(result) {
-  assert.equal(result.isError, undefined, result.content[0]?.text);
-  return JSON.parse(result.content[0].text);
-}
-
-function result(params, images = [{ buffer: png, ext: 'png', mimeType: 'image/png', seed: 12 }]) {
-  return { images, seed: params.seed ?? 12, model: params.model, requestedModel: params.model, rawBuffer: png };
-}
-
-test('渐进式默认只列出三个工具，实际列表比平铺模式至少缩小 85%', async t => {
-  const progressive = await connect(t, { client: {} });
-  const legacy = await connect(t, { client: {}, disclosureMode: 'legacy' });
-  const progressiveList = await progressive.listTools();
-  const legacyList = await legacy.listTools();
-  assert.deepEqual(progressiveList.tools.map(tool => tool.name), ['nai_discover', 'nai_describe', 'nai_execute']);
-  assert.equal(PROGRESSIVE_TOOL_COUNT, 3);
-  assert.equal(legacyList.tools.length, 13);
-  const listJson = JSON.stringify(progressiveList);
-  assert.doesNotMatch(listJson, /base_prompt|1,048,576|1\.3::halftone::/);
-  const progressiveBytes = Buffer.byteLength(listJson);
-  const legacyBytes = Buffer.byteLength(JSON.stringify(legacyList));
-  const estimatedSavedPercent = (1 - progressiveBytes / legacyBytes) * 100;
-  assert.ok(estimatedSavedPercent >= 85, `${progressiveBytes} / ${legacyBytes} 字节`);
-  assert.deepEqual(getDisclosureMetrics(), {
-    progressiveTools: 3, legacyTools: 13, progressiveBytes, legacyBytes, estimatedSavedPercent,
-  });
-  assert.equal((await progressive.callTool({ name: 'get_subscription' })).isError, true);
-  assert.equal((await legacy.callTool({ name: 'nai_discover' })).isError, true);
-});
-
-test('渐进式发现、描述和执行复用动作参数、风格指南与出图回执', async t => {
-  const archiveDir = await mkdtemp(join(tmpdir(), 'nai-progressive-'));
-  t.after(() => rm(archiveDir, { recursive: true, force: true }));
-  const completed = [];
-  const generated = [];
-  let balance = 120;
-  const client = {
-    getSubscription: async () => ({
-      raw: {}, summary: { tier: 3, tierName: 'Opus', active: true, fixedAnlas: balance, purchasedAnlas: 0, totalAnlas: balance },
-    }),
-    suggestTags: async ({ prompt, model, lang }) => {
-      assert.deepEqual([prompt, model, lang], ['tree', DEFAULT_MODEL, 'en']);
-      return { tags: [{ tag: 'tree' }, { tag: 'tree shadow' }] };
-    },
-    generateImage: async params => {
-      generated.push(params);
-      balance -= 17;
-      return result({ ...params, model: params.model ?? DEFAULT_MODEL });
-    },
-  };
-  const progressive = await connect(t, { client, archiveDir, imageOrigin: origin, onToolCompleted: event => completed.push(event) });
-  const legacy = await connect(t, { client, disclosureMode: 'legacy' });
-  const invoke = (name, args) => progressive.callTool({ name, arguments: args });
-  const execute = (action, params) => invoke('nai_execute', { action, params });
-
-  const { tools } = await legacy.listTools();
-  const { modules } = jsonContent(await invoke('nai_discover'));
-  assert.deepEqual(modules.map(entry => entry.module), ['generate', 'enhance', 'assist', 'guides', 'library']);
-  assert.deepEqual(modules.flatMap(entry => entry.actions.map(action => action.name)).sort(), tools.map(tool => tool.name).sort());
-  const enhance = jsonContent(await invoke('nai_discover', { module: 'enhance' }));
-  assert.deepEqual(enhance.modules.map(entry => entry.module), ['enhance']);
-  assert.deepEqual(enhance.modules[0].actions.map(action => action.name), ['augment_image', 'upscale_image', 'encode_vibe']);
-  const match = jsonContent(await invoke('nai_discover', { module: 'generate', query: ' GENERATE_IMAGE ' }));
-  assert.deepEqual(match.modules[0].actions.map(action => action.name), ['generate_image']);
-  assert.deepEqual(jsonContent(await invoke('nai_discover', { module: 'assist', query: 'generate_image' })), { modules: [] });
-  assert.equal(jsonContent(await invoke('nai_discover', { query: 'cost_policy' })).modules[0].guides[0].name, 'cost_policy');
-
-  const described = jsonContent(await invoke('nai_describe', { actions: ['generate_image'] }));
-  assert.deepEqual(described.actions[0].inputSchema, tools.find(tool => tool.name === 'generate_image').inputSchema);
-  const stylist = { topic: 'decontaminate', blueprint: 'retro_90s_cel' };
-  const stylistResult = await invoke('nai_describe', { guide: 'v5_stylist', ...stylist });
-  assert.equal(stylistResult.content[0].text, renderV5StylistGuide(stylist));
-  const costResult = await invoke('nai_describe', { guide: 'cost_policy' });
-  assert.match(costResult.content[0].text, /Opus.*1,048,576.*V5.*Anlas/);
-  const models = jsonContent(await invoke('nai_describe', { guide: 'models' }));
-  assert.equal(models.defaultModel, DEFAULT_MODEL);
-  assert.deepEqual(models.models.map(entry => entry.model), IMAGE_MODELS);
-  assert.equal(models.models.find(entry => entry.model === 'nai-diffusion-5-full-medium').steps, 14);
-
-  const { prompts } = await progressive.listPrompts();
-  assert.equal(prompts[0].name, 'novelai-v5-stylist');
-  const promptRequest = { name: prompts[0].name, arguments: { aesthetic: 'pop halftone' } };
-  assert.deepEqual(await progressive.getPrompt(promptRequest), await legacy.getPrompt(promptRequest));
-  const { resources } = await progressive.listResources();
-  assert.equal(resources[0].uri, 'novelai://skills/v5-stylist');
-  const resourceRequest = { uri: resources[0].uri };
-  assert.deepEqual(await progressive.readResource(resourceRequest), await legacy.readResource(resourceRequest));
-  assert.deepEqual(completed, []);
-
-  assert.deepEqual(await execute('get_subscription'), await legacy.callTool({ name: 'get_subscription' }));
-  const tagArgs = { prompt: 'tree', model: DEFAULT_MODEL, lang: 'en', limit: 1 };
-  const tags = await execute('suggest_tags', tagArgs);
-  assert.deepEqual(jsonContent(tags), { tags: [{ tag: 'tree' }] });
-  assert.deepEqual(tags, await legacy.callTool({ name: 'suggest_tags', arguments: tagArgs }));
-  assert.equal((await execute('generate_image', { base_prompt: 'test', width: '64' })).isError, true);
-  assert.equal((await execute('generate_image', [])).isError, true);
-  assert.equal((await execute('nai_discover')).isError, true);
-  assert.equal(generated.length, 0);
-
-  const output = await execute('generate_image', {
-    input: '月下松林', width: 64, height: 64, characters: { prompt: '旅人' },
-  });
-  assert.equal(output.isError, undefined, output.content[0]?.text);
-  assert.equal(generated.length, 1);
-  assert.equal(generated[0].prompt, '月下松林');
-  assert.deepEqual(generated[0].characterPrompts[0].center, { x: 0.5, y: 0.5 });
-  assert.match(output.content[0].text, /\[查看或下载图片\]\(https:\/\/images\.example\.com\/novelai-images\/[A-Za-z0-9_-]{43}\.png\)/);
-  assert.match(output.content[0].text, /本次消耗：17 Anlas，当前剩余 103 Anlas/);
-  assert.deepEqual(output.content[1], { type: 'image', mimeType: 'image/png', data: png.toString('base64') });
-  assert.deepEqual(completed, [{ tool: 'get_subscription' }, { tool: 'suggest_tags' }, { tool: 'generate_image', anlasSpent: 17 }]);
-});
-
-testBothModes('Vibe 自动编码跨 generate、img2img、encode_vibe 和进程重启复用，V3 传标准原图', async (t, connectTools) => {
-  const archiveDir = await mkdtemp(join(tmpdir(), 'nai-tool-vibes-'));
-  t.after(() => rm(archiveDir, { recursive: true, force: true }));
-  const incoming = [];
-  let encodes = 0;
-  const novelai = {
-    encodeVibe: async params => {
-      encodes++;
-      assert.equal(params.model, v45);
-      assert.deepEqual(Buffer.from(params.image, 'base64'), png);
-      return encoded;
-    },
-    generateImage: async params => {
-      incoming.push(params);
-      return result(params);
-    },
-  };
-  const invoke = await connectTools({ client: novelai, archiveDir, imageOrigin: origin });
-  const first = await invoke('generate_image', {
-    base_prompt: '月下背景', model: v45, vibe_references: [{ image: source, information_extracted: 0.75 }],
-  });
-  assert.equal(first.isError, undefined);
-  assert.equal(first.content[0].type, 'text');
-  const [id] = first.content[0].text.match(/vibe_[a-f0-9]{16}/);
-  assert.match(first.content[0].text, /\[查看或下载图片\]\(https:\/\/images\.example\.com\/novelai-images\//);
-  assert.equal(first.content[1].type, 'image');
-  assert.equal(incoming[0].vibeReferences[0].encoded_vibe, encoded);
-
-  const restarted = await connectTools({ client: novelai, archiveDir, imageOrigin: origin });
-  const cached = await restarted('img2img', {
-    base_prompt: '溪流', model: v45, source_image: source,
-    vibe_references: [{ image: source, information_extracted: 0.75 }, { vibe_id: id }],
-  });
-  assert.equal(cached.isError, undefined);
-  assert.deepEqual(incoming[1].vibeReferences.map(vibe => vibe.encoded_vibe), [encoded, encoded]);
-  assert.deepEqual(
-    await sharp(Buffer.from(incoming[1].image, 'base64')).metadata().then(({ width, height }) => [width, height]),
-    [128, 192],
-  );
-  const encodedTool = await restarted('encode_vibe', {
-    source_image: source, model: v45, information_extracted: 0.75,
-  });
-  assert.deepEqual(JSON.parse(encodedTool.content[0].text), {
-    vibe_id: id, model: v45, information_extracted: 0.75,
-  });
-  assert.equal(encodes, 1);
-
-  const raw = await invoke('generate_image', { base_prompt: '溪流', model: v3, vibe_references: [{ image: source }] });
-  assert.equal(raw.isError, undefined);
-  const rawMetadata = await sharp(Buffer.from(incoming[2].vibeReferences[0].image, 'base64')).metadata();
-  assert.deepEqual([rawMetadata.width, rawMetadata.height, rawMetadata.format], [448, 448, 'png']);
-  assert.equal(encodes, 1);
-});
-
-testBothModes('能力校验早于参考读取与编码，兼容旧别名和单个角色对象', async (_t, connectTools) => {
-  const incoming = [];
-  const invoke = await connectTools({
-    client: {
-      encodeVibe: async () => assert.fail('不应请求 Vibe 编码'),
-      generateImage: async params => {
-        incoming.push(params);
-        return result(params);
-      },
-    },
-  });
-  const failure = await invoke('generate_image', {
-    base_prompt: 'test', model: v45,
-    character_references: [{ image: '/不可读取.png', type: 'character' }],
-    vibe_references: [{ image: '/不可读取.png' }],
-  });
-  assert.equal(failure.isError, true);
-  assert.match(failure.content[0].text, /不能同时使用/);
-  const missing = await invoke('inpaint_image', { source_image: source, base_prompt: 'test' });
-  assert.equal(missing.isError, true);
-  assert.match(missing.content[0].text, /mask_image.*mask_regions/);
-  const older = await invoke('generate_image', {
-    prompt: '旧客户端提示词', characters: { prompt: '独立角色' }, model: v45,
-  });
-  assert.equal(older.isError, undefined);
-  assert.deepEqual(incoming[0].characterPrompts[0].center, { x: 0.5, y: 0.5 });
-  assert.equal(incoming[0].prompt, '旧客户端提示词');
-  const inpainted = await invoke('inpaint_image', {
-    source_image: source, base_prompt: '修复高光', mask_regions: [{ x: 0, y: 0, width: 0.5, height: 0.5 }],
-  });
-  assert.equal(inpainted.isError, undefined, inpainted.content[0]?.text);
-  assert.equal(incoming[1].action, 'infill');
-  assert.ok(incoming[1].mask);
-});
-
-testBothModes('缩图再放大，保存回执使用实际图片尺寸，并保留归档失败降级', async (t, connectTools) => {
-  const directory = await mkdtemp(join(tmpdir(), 'nai-tool-result-'));
-  t.after(() => rm(directory, { recursive: true, force: true }));
-  const archiveDir = join(directory, 'not-a-directory');
-  await writeFile(archiveDir, '归档失败');
-  const large = await sharp({ create: {
-    width: 1900, height: 900, channels: 3, background: '#123456',
-  }}).png().toBuffer();
-  const invoke = await connectTools({
-    archiveDir,
-    client: {
-      upscaleImage: async ({ image }) => {
-        const { width, height } = await sharp(Buffer.from(image, 'base64')).metadata();
-        assert.equal(width % 8, 0);
-        assert.equal(height % 8, 0);
-        assert.ok(width * height <= 1048576);
-        return [{ buffer: png, ext: 'png', mimeType: 'image/png' }];
-      },
-    },
-  });
-  const output = await invoke('upscale_image', { source_image: large.toString('base64') });
-  assert.equal(output.isError, undefined);
-  assert.match(output.content[0].text, /101×190/);
-  assert.match(output.content[0].text, /服务器保存失败.*请勿.*自动重新出图/s);
-  assert.equal(output.content[1].data, png.toString('base64'));
-});
-
-testBothModes('img2img 省略角色 center_x 默认居中，非 PNG 源图在 augment/upscale/encode_vibe 自动转 PNG', async (_t, connectTools) => {
-  const gif = await sharp({
-    create: { width: 64, height: 64, channels: 3, background: '#2266aa' },
-  }).gif().toBuffer();
-  const gifInput = `data:image/gif;base64,${gif.toString('base64')}`;
-  const received = { img2img: null, augment: null, upscale: null, encode: null };
-  const invoke = await connectTools({
-    client: {
-      generateImage: async params => {
-        received.img2img = params;
-        return result(params);
-      },
-      augmentImage: async params => {
-        received.augment = Buffer.from(params.image, 'base64');
-        return [{ buffer: png, ext: 'png', mimeType: 'image/png' }];
-      },
-      upscaleImage: async params => {
-        received.upscale = Buffer.from(params.image, 'base64');
-        return [{ buffer: png, ext: 'png', mimeType: 'image/png' }];
-      },
-      encodeVibe: async params => {
-        received.encode = Buffer.from(params.image, 'base64');
-        return encoded;
-      },
-    },
-  });
-
-  const img2imgRes = await invoke('img2img', {
-    base_prompt: 'forest',
-    source_image: source,
-    model: v45,
-    characters: [{ prompt: '1girl' }],
-  });
-  assert.equal(img2imgRes.isError, undefined);
-  assert.deepEqual(received.img2img.characterPrompts[0].center, { x: 0.5, y: 0.5 });
-
-  const augRes = await invoke('augment_image', { source_image: gifInput, req_type: 'lineart' });
-  assert.equal(augRes.isError, undefined);
-  assert.equal((await sharp(received.augment).metadata()).format, 'png');
-
-  const upRes = await invoke('upscale_image', { source_image: gifInput, auto_fit_1mp: false });
-  assert.equal(upRes.isError, undefined);
-  assert.equal((await sharp(received.upscale).metadata()).format, 'png');
-
-  const encRes = await invoke('encode_vibe', { source_image: gifInput, model: v45 });
-  assert.equal(encRes.isError, undefined);
-  assert.equal((await sharp(received.encode).metadata()).format, 'png');
-});
-
-testBothModes('出图自动对比前后订阅余额并回报每张消耗 Anlas、V5 额度条变化与归档记录', async (t, connectTools) => {
-  const archiveDir = await mkdtemp(join(tmpdir(), 'nai-tool-cost-'));
-  t.after(() => rm(archiveDir, { recursive: true, force: true }));
-  const snapshots = [
-    // 单张付费：5670 -> 5650（消耗 20 Anlas）
-    { tier: 0, tierName: 'Paper', active: false, fixedAnlas: 0, purchasedAnlas: 5670, totalAnlas: 5670 },
-    { tier: 0, tierName: 'Paper', active: false, fixedAnlas: 0, purchasedAnlas: 5650, totalAnlas: 5650 },
-    // 多张（2 张）付费：5650 -> 5614（共 36，约 18 Anlas/张）
-    { tier: 0, tierName: 'Paper', active: false, fixedAnlas: 0, purchasedAnlas: 5650, totalAnlas: 5650 },
-    { tier: 0, tierName: 'Paper', active: false, fixedAnlas: 0, purchasedAnlas: 5614, totalAnlas: 5614 },
-    // V5 额度条消耗（0 Anlas，100% -> 98%）
-    { tier: 3, tierName: 'Opus', active: true, fixedAnlas: 10000, purchasedAnlas: 0, totalAnlas: 10000, v5Usage: { percent: 100, purchasedPercent: 0, isNegative: false } },
-    { tier: 3, tierName: 'Opus', active: true, fixedAnlas: 10000, purchasedAnlas: 0, totalAnlas: 10000, v5Usage: { percent: 98, purchasedPercent: 0, isNegative: false } },
+test('免费无效请求全部在配额和上游前拒绝，包括原始尺寸、引用空数组、编辑动作和未声明字段', async t => {
+  const api = upstream();
+  let reservations = 0;
+  const { call } = await connect(t, { mode: 'free', client: api.client, quota: { run: () => { reservations++; throw new Error('不应进入配额'); } } });
+  const invalid = [
+    [{ width: 831 }, /width.*64/], [{ height: 1215 }, /height.*64/], [{ width: 1024, height: 1088 }, /1,048,576/],
+    [{ width: 1024 }, /1,048,576/], [{ steps: 29 }, /steps.*28/], [{ steps: '28' }, /steps/], [{ model: 'unknown' }, /不支持该模型.*可选模型/],
+    [{ base_prompt: '  ' }, /base_prompt/], [{ character_references: [] }, /character_references.*请配置个人 API Key/], [{ vibe_references: [] }, /vibe_references.*请配置个人 API Key/],
+    [{ character_references: [{ image: source, type: 'character' }] }, /character_references/],
+    [{ vibe_references: [{ image: source }] }, /vibe_references/], [{ n_samples: 2 }, /n_samples.*1/],
+    [{ source_image: source }, /source_image/], [{ image: source }, /image/], [{ action: 'infill' }, /action/],
+    [{ mask: source }, /mask/], [{ mask_regions: [region] }, /mask_regions/], [{ controlnet_condition: source }, /controlnet_condition/],
+    [{ reference_image_multiple: [] }, /reference_image_multiple/], [{ parameters: { image: source } }, /parameters/],
+    [{ characters: [{ prompt: '人物', image: source }] }, /image/], [{ surprise: true }, /surprise/],
+    [{ model: v45, characters: Array.from({ length: 7 }, () => ({ prompt: '人物' })) }, /6/],
   ];
-  let idx = 0;
-  const invoke = await connectTools({
-    archiveDir,
-    imageOrigin: origin,
-    client: {
-      getSubscription: async () => ({ raw: {}, summary: snapshots[idx++] }),
-      generateImage: async params => {
-        const count = params.n_samples ?? 1;
-        const images = Array.from({ length: count }, (_, i) => ({ buffer: png, ext: 'png', mimeType: 'image/png', seed: 100 + i }));
-        return result(params, images);
-      },
-    },
-  });
-
-  const paidSingle = await invoke('generate_image', { base_prompt: 'single' });
-  assert.equal(paidSingle.isError, undefined);
-  assert.match(paidSingle.content[0].text, /消耗 20 Anlas/);
-  assert.match(paidSingle.content[0].text, /本次消耗：20 Anlas，当前剩余 5650 Anlas/);
-  const [singleId] = paidSingle.content[0].text.match(/[A-Za-z0-9_-]{43}/);
-  const singleMeta = await invoke('list_archived_images', { image_id: singleId });
-  const parsedMeta = JSON.parse(singleMeta.content[1].text);
-  assert.equal(parsedMeta.anlas_spent, 20);
-
-  const paidMulti = await invoke('generate_image', { base_prompt: 'multi', n_samples: 2 });
-  assert.equal(paidMulti.isError, undefined);
-  assert.match(paidMulti.content[0].text, /约 18 Anlas\/张/);
-  assert.match(paidMulti.content[0].text, /共 36 Anlas（2 张，约 18 Anlas\/张），当前剩余 5614 Anlas/);
-
-  const v5Meter = await invoke('generate_image', { base_prompt: 'v5', model: 'nai-diffusion-5-full' });
-  assert.equal(v5Meter.isError, undefined);
-  assert.match(v5Meter.content[0].text, /本次消耗：0 Anlas（V5 额度条 100% → 98%），当前剩余 10000 Anlas/);
+  for (const [fields, message] of invalid) rejected(await call('generate_image', { base_prompt: '山水', ...fields }), message);
+  assert.equal(reservations, 0);
+  assert.deepEqual(api.calls, []);
 });
 
-testBothModes('get_v5_stylist_guide 返回完整指南、分章节与预设风格蓝图', async (_t, connectTools) => {
-  const invoke = await connectTools({ client: {} });
-  const full = await invoke('get_v5_stylist_guide', {});
-  assert.equal(full.isError, undefined);
-  assert.match(full.content[0].text, /novelai-v5-stylist/);
-  assert.match(full.content[0].text, /1\.3::halftone::/);
-  assert.match(full.content[0].text, /Select `nai-diffusion-5-curated`[\s\S]*as the default/);
-
-  const bp = await invoke('get_v5_stylist_guide', { topic: 'decontaminate', blueprint: 'retro_90s_cel' });
-  assert.equal(bp.isError, undefined);
-  assert.match(bp.content[0].text, /推荐模型.*`nai-diffusion-5-curated`/);
-  assert.match(bp.content[0].text, /year 1995/);
-  assert.match(bp.content[0].text, /-3::glossy skin/);
+test('免费默认、四个模型及边界尺寸均走一次共享配额，模板不占用配额', async t => {
+  const events = [];
+  const api = upstream({ generateImage: async params => {
+    events.push(['generate', params.model]);
+    assert.equal(params.action, 'generate');
+    assert.equal(params.n_samples, 1);
+    assert.ok(!('image' in params) && !('mask' in params) && !('characterReferences' in params) && !('vibeReferences' in params));
+    return generation(params);
+  } });
+  const quota = { run: async (model, generate) => {
+    events.push(['reserve', model]);
+    const actual = await generate();
+    assert.ok(Array.isArray(actual.images), 'run 回调只返回上游原始结果，不含本地回执');
+    events.push(['complete', model]);
+    return actual;
+  } };
+  const { call } = await connect(t, { mode: 'free', client: api.client, quota });
+  success(await call('get_nai_prompt'));
+  const cases = [undefined, ...IMAGE_MODELS];
+  for (const model of cases) {
+    const args = model ? { model, width: 1024, height: 1024, steps: 28, n_samples: 1 } : {};
+    const content = success(await call('generate_image', { base_prompt: '松林', characters: [{ prompt: '旅人' }], ...args }));
+    imageContent(content, 1, outputs.png);
+  }
+  assert.deepEqual(events, cases.flatMap(m => ['reserve', 'generate', 'complete'].map(e => [e, m ?? DEFAULT_MODEL])));
+  assert.equal(api.calls.length, cases.length);
+  assert.deepEqual([api.calls[0].args[0].width, api.calls[0].args[0].height], [832, 1216]);
 });
 
-testBothModes('省略 model 但带精确参考或 Vibe 时自动临时路由并在回执提醒切回 V5 Curated', async (t, connectTools) => {
-  const archiveDir = await mkdtemp(join(tmpdir(), 'nai-auto-ref-'));
-  t.after(() => rm(archiveDir, { recursive: true, force: true }));
-  const incoming = [];
-  const invoke = await connectTools({
-    archiveDir,
-    client: {
-      encodeVibe: async ({ model }) => {
-        assert.equal(model, v45);
-        return encoded;
-      },
-      generateImage: async params => {
-        incoming.push(params);
-        return result(params);
-      },
-    },
-  });
+test('免费配额缺失或拒绝时不调用上游；只将上游本身的异常交给配额处理', async t => {
+  const api = upstream({ generateImage: async () => { throw new Error('生成未成功'); } });
+  const request = { base_prompt: '海边' };
+  for (const [quota, message] of [[undefined, /配额/], [{ run: () => { throw new Error('额度用尽'); } }, /额度用尽/]]) {
+    const { call } = await connect(t, { mode: 'free', client: api.client, quota });
+    rejected(await call('generate_image', request), message);
+  }
+  assert.equal(api.calls.length, 0);
+  const errors = [];
+  const { call } = await connect(t, { mode: 'free', client: api.client, quota: { async run(_model, generate) {
+    try { return await generate(); } catch (error) { errors.push(error.message); throw error; }
+  } } });
+  rejected(await call('generate_image', request), /生成未成功/);
+  assert.deepEqual(errors, ['生成未成功']);
+  assert.equal(api.calls.length, 1);
+});
 
-  const preciseRes = await invoke('generate_image', {
-    base_prompt: '1girl, solo',
-    character_references: [{ image: source, type: 'character' }],
-  });
-  assert.equal(preciseRes.isError, undefined, preciseRes.content[0]?.text);
-  assert.equal(incoming[0].model, v45);
-  assert.match(preciseRes.content[0].text, /character_references[\s\S]*后续普通生图或 img2img 请继续省略 model 以默认走 nai-diffusion-5-curated/);
+test('上游成功后归档失败仍然计入免费配额，保留原始 MCP 图片，不承诺下载链接', async t => {
+  const archiveDir = join(await temp(t), 'not-a-directory');
+  await writeFile(archiveDir, 'not a directory');
+  let committed = 0;
+  const api = upstream({ generateImage: async params => generation(params, outputs.webp) });
+  const { call } = await connect(t, { mode: 'free', client: api.client, archiveDir, imageOrigin, quota: { async run(_model, generate) {
+    const actual = await generate();
+    assert.equal(actual.images[0], outputs.webp);
+    committed++;
+    return actual;
+  } } });
+  const content = success(await call('generate_image', { base_prompt: '海边' }));
+  assert.match(content[0].text, /服务器保存失败.*请勿.*自动重新出图/);
+  assert.doesNotMatch(content[0].text, /image_id|分钟内有效/);
+  assert.equal(committed, 1);
+  assert.equal(api.calls.length, 1);
+  imageContent(content, 1, outputs.webp);
+});
 
-  const vibeRes = await invoke('generate_image', {
-    base_prompt: '1girl, solo',
-    vibe_references: [{ image: source }],
-  });
-  assert.equal(vibeRes.isError, undefined, vibeRes.content[0]?.text);
-  assert.equal(incoming[1].model, v45);
-  assert.match(vibeRes.content[0].text, /vibe_references[\s\S]*后续普通生图或 img2img 请继续省略 model 以默认走 nai-diffusion-5-curated/);
+test('付费基础回归：生成、图生图与两种局部遮罩，实际尺寸和 PNG/WebP/JPEG 的原字节、ID、带前缀 URL', async t => {
+  const archiveDir = await temp(t);
+  const api = upstream({ generateImage: async params => generation(params, ({ generate: outputs.webp, img2img: outputs.jpg, infill: outputs.png })[params.action]) });
+  const { call } = await connect(t, { mode: 'paid', client: api.client, archiveDir, imageOrigin });
+  const first = success(await call('generate_image', { base_prompt: '星空', seed: 9, image_format: 'webp', width: 65, height: 100 }));
+  assert.match(first[0].text, /101×190/);
+  assert.match(first[0].text, /图片下载链接 5 分钟内有效，过期将自动清理。$/);
+  assert.doesNotMatch(first[0].text, /Anlas|本次消耗/);
+  imageContent(first, 1, outputs.webp);
+  const { id } = receiptLink(first[0].text, 'webp');
+  const second = success(await call('img2img', {
+    base_prompt: '星夜', source_image: id, model: v45, n_samples: 1, strength: 0.35, noise: 0.1, extra_noise_seed: 16,
+    color_correct: false, characters: [{ prompt: '旅人', negative_prompt: '伞' }],
+  }));
+  imageContent(second, 1, outputs.jpg);
+  receiptLink(second[0].text, 'jpg');
+  for (const mask of [{ mask_image: source }, { mask_regions: [region] }]) {
+    const painted = success(await call('inpaint_image', { base_prompt: '高光', source_image: id, ...mask, inpaint_strength: 0.6, add_original_image: false }));
+    receiptLink(painted[0].text, 'png');
+    imageContent(painted, 1, outputs.png);
+  }
+  assert.deepEqual(api.calls.map(c => c.name), Array(4).fill('generateImage'));
+  const [generated, edited, ...painted] = api.calls.map(c => c.args[0]);
+  assert.deepEqual([generated.model, generated.width, generated.height, generated.n_samples], [DEFAULT_MODEL, 64, 128, 1]);
+  assert.deepEqual([edited.action, edited.width, edited.height, edited.strength, edited.color_correct, edited.noise, edited.extra_noise_seed], ['img2img', 128, 192, 0.35, false, 0.1, 16]);
+  assert.deepEqual(edited.characterPrompts, [{ prompt: '旅人', uc: '伞', center: { x: 0.5, y: 0.5 }, enabled: true }]);
+  for (const p of painted) {
+    assert.deepEqual([p.model, p.action, p.inpaintImg2ImgStrength, p.add_original_image], [DEFAULT_MODEL, 'infill', 0.6, false]);
+    const { width, height, format } = await sharp(Buffer.from(p.mask, 'base64')).metadata();
+    assert.deepEqual([width, height, format], [128, 192, 'png']);
+  }
+});
 
-  // 显式指定不支持精确参考的模型时仍保持严格报错
-  const explicitFail = await invoke('generate_image', {
-    base_prompt: '1girl, solo',
-    model: DEFAULT_MODEL,
-    character_references: [{ image: source, type: 'character' }],
+test('付费参数错误及局部重绘任何 vibe_references：不读缓存、不编码、不回退、不调用上游', async t => {
+  const api = upstream();
+  let cacheReads = 0;
+  const vibeCache = { getById: () => { cacheReads++; throw new Error('不应读缓存'); } };
+  const { call } = await connect(t, { mode: 'paid', client: api.client, vibeCache });
+  const base = { base_prompt: '高光' };
+  for (const tool of names.slice(0, 3)) {
+    for (const n_samples of [0, 2, '1', null]) rejected(await call(tool, { ...base, n_samples }), /n_samples.*1/);
+  }
+  for (const model of [undefined, ...IMAGE_MODELS]) {
+    for (const vibe_references of [[], [{ image: source }], [{ vibe_id: 'vibe_0000000000000000' }], null]) {
+      rejected(await call('inpaint_image', { ...base, model, source_image: 'not-an-image', vibe_references }), /局部重绘.*不支持.*vibe_references/);
+    }
+  }
+  rejected(await call('inpaint_image', { ...base, source_image: source }), /mask_image.*mask_regions/);
+  rejected(await call('generate_image', { ...base, width: 2048, height: 2048 }), /3,145,728/);
+  rejected(await call('generate_image', { ...base, character_references: [{ image: source, type: 'character' }], vibe_references: [{ image: source }] }), /不能同时/);
+  for (const tool of names.slice(0, 3)) {
+    const args = tool === 'generate_image' ? base : { ...base, source_image: source, ...(tool === 'inpaint_image' && { mask_regions: [region] }) };
+    rejected(await call(tool, { ...args, character_references: [{ image: source, type: 'character' }] }), /默认模型.*显式选择 V4\.5/);
+    if (tool !== 'inpaint_image') rejected(await call(tool, { ...args, vibe_references: [{ vibe_id: 'vibe_0000000000000000' }] }), /默认模型.*显式选择 V4\.5/);
+    const badModel = await call(tool, { ...args, model: 'nai-diffusion-4-full' });
+    rejected(badModel, /不支持该模型.*可选模型/);
+    for (const model of IMAGE_MODELS) assert.ok(badModel.content[0].text.includes(model));
+  }
+  rejected(await call('generate_image', { ...base, model: DEFAULT_MODEL, character_references: [{ image: source, type: 'character' }] }), /V4\.5/);
+  rejected(await call('generate_image', { ...base, model: v45, vibe_references: [{ image: source }, { encoded_vibe: '!' }] }), /Base64/);
+  rejected(await call('img2img', { ...base, source_image: source, mask: source }), /mask/);
+  rejected(await call('augment_image', { source_image: source, req_type: 'emotion' }), /emotion/);
+  rejected(await call('encode_vibe', { source_image: source, crop_to_mask: true }), /mask_image/);
+  assert.equal(cacheReads, 0);
+  assert.deepEqual(api.calls, []);
+});
+
+test('V4.5 参考：显式选择模型后可用精确参考及自动编码；共享数据目录可跨实例复用编码', async t => {
+  const archiveDir = await temp(t), dataDir = await temp(t);
+  const api = upstream({ encodeVibe: async () => encoded, generateImage: async params => generation(params) });
+  const options = { mode: 'paid', client: api.client, archiveDir };
+  const { call } = await connect(t, { ...options, vibeCache: new VibeCache(dataDir) });
+  const precise = { image: source, type: 'character', strength: 0.8, fidelity: 0.7 };
+  success(await call('generate_image', { base_prompt: '海风', model: v45, character_references: [precise] }));
+  const p = api.calls[0].args[0];
+  assert.equal(p.model, v45);
+  assert.equal(p.characterReferences[0].fidelity, 0.7);
+  const size = await sharp(Buffer.from(p.characterReferences[0].image, 'base64')).metadata();
+  assert.deepEqual([size.width, size.height], [1024, 1536]);
+
+  const vibe = { image: source, information_extracted: 0.75 };
+  const generated = success(await call('generate_image', { base_prompt: '民居', model: v45, vibe_references: [vibe] }));
+  const [id] = generated[0].text.match(/vibe_[a-f0-9]{16}/);
+  assert.equal(api.calls[2].args[0].vibeReferences[0].encoded_vibe, encoded);
+  const restarted = await connect(t, { ...options, vibeCache: new VibeCache(dataDir) });
+  const summary = JSON.parse(success(await restarted.call('encode_vibe', {
+    source_image: source, model: v45, information_extracted: 0.75, include_raw_base64: true,
+  }))[0].text);
+  assert.deepEqual(summary, { vibe_id: id, model: v45, information_extracted: 0.75, encoded_vibe: encoded });
+  success(await restarted.call('img2img', { base_prompt: '壁画', source_image: source, model: v45, vibe_references: [vibe, { vibe_id: id }, { encoded_vibe: encoded }] }));
+  assert.deepEqual(api.calls.at(-1).args[0].vibeReferences.map(x => x.encoded_vibe), Array(3).fill(encoded));
+  rejected(await restarted.call('generate_image', { base_prompt: '山', model: 'nai-diffusion-4-5-curated', vibe_references: [{ vibe_id: id }] }), /模型不同/);
+  rejected(await restarted.call('generate_image', { base_prompt: '山', model: v45, vibe_references: [{ vibe_id: id, information_extracted: 0.5 }] }), /提取比例/);
+  assert.deepEqual(api.calls.map(c => c.name), ['generateImage', 'encodeVibe', 'generateImage', 'generateImage']);
+});
+
+test('付费增强、放大、编码、标签和订阅：只发业务请求，显式查询才取订阅且保留完整 JSON', async t => {
+  const archiveDir = await temp(t);
+  const raw = { balance: 100, usage: { requests: 4 }, extra: { unchanged: [null, false, 7] } };
+  const summary = '账户余额 100，已使用 4 次。';
+  const api = upstream({
+    augmentImage: async () => [outputs.png, outputs.webp, outputs.jpg], upscaleImage: async () => [outputs.webp], encodeVibe: async () => encoded,
+    suggestTags: async () => ({ tags: [{ tag: 'tree', count: 3 }, { tag: 'tree shadow' }] }), getSubscription: async () => ({ raw, summary }),
   });
-  assert.equal(explicitFail.isError, true);
-  assert.match(explicitFail.content[0].text, /精确参考仅支持 V4\.5/);
+  let quotaRuns = 0;
+  const { call } = await connect(t, { mode: 'paid', client: api.client, archiveDir, imageOrigin, imageTtlMs: 90000, quota: { run: () => { quotaRuns++; throw new Error('付费不应经过免费配额'); } } });
+  const input = `data:image/gif;base64,${gif.toString('base64')}`;
+  const augmented = success(await call('augment_image', { source_image: input, req_type: 'bg-removal' }));
+  for (const [index, image] of Object.values(outputs).entries()) {
+    imageContent(augmented, index + 1, image);
+    receiptLink(augmented[0].text.split('\n')[index + 1], image.ext);
+  }
+  assert.match(augmented[0].text, /图片下载链接 90 秒内有效，过期将自动清理。$/);
+  success(await call('upscale_image', { source_image: input, declared_blur_sigma: 0.2, auto_fit_1mp: false }));
+  const vibe = JSON.parse(success(await call('encode_vibe', { source_image: input, mask_image: source, crop_to_mask: true }))[0].text);
+  assert.deepEqual(Object.keys(vibe).sort(), ['information_extracted', 'model', 'vibe_id']);
+  assert.deepEqual(JSON.parse(success(await call('suggest_tags', { prompt: 'tree', limit: 1 }))[0].text), { tags: [{ tag: 'tree', count: 3 }] });
+  assert.deepEqual(api.calls.map(c => c.name), ['augmentImage', 'upscaleImage', 'encodeVibe', 'suggestTags']);
+  for (const { args: [args] } of api.calls.slice(0, 3)) assert.equal((await sharp(Buffer.from(args.image, 'base64')).metadata()).format, 'png');
+  assert.deepEqual(api.calls[3].args, [{ prompt: 'tree', model: DEFAULT_MODEL, lang: 'en' }]);
+  const info = success(await call('get_subscription'));
+  assert.deepEqual(info.map(c => c.type), ['text', 'text']);
+  assert.equal(info[0].text, summary);
+  assert.deepEqual(JSON.parse(info[1].text), raw);
+  assert.deepEqual(api.calls.slice(4), [{ name: 'getSubscription', args: [] }]);
+  assert.equal(quotaRuns, 0);
+  assert.ok(!(await readdir(archiveDir)).includes('.vibe-cache'), '未注入持久缓存时不能把编码写进图片目录');
+});
+
+test('本站带前缀 URL 可直接用于编辑；过期 ID、过期 URL 和本地文件路径均在上游前拒绝', async t => {
+  const archiveDir = await temp(t);
+  // HTTP 在这里仅能命中本站归档；即使路径规则回归也不会进行网络下载。
+  const base = new URL('http://archive.invalid/service/nai/');
+  const api = upstream({ generateImage: async params => generation(params) });
+  const { call } = await connect(t, { mode: 'paid', client: api.client, archiveDir, imageOrigin: base, imageTtlMs: 90000 });
+  const args = { base_prompt: '雪地' };
+  const output = success(await call('generate_image', args));
+  const [, id, url] = /image_id ([A-Za-z0-9_-]{43}) · \[查看或下载图片\]\(([^)]+)\)/.exec(output[0].text);
+  assert.equal(url, `http://archive.invalid/service/nai/novelai-images/${id}.png`);
+  success(await call('img2img', { ...args, source_image: url }));
+  const metadataFile = join(archiveDir, id, 'metadata.json');
+  const metadata = JSON.parse(await readFile(metadataFile, 'utf8'));
+  metadata.created_at = new Date(Date.now() - 120000).toISOString(); // 超过自定义 TTL，但未超过默认 5 分钟。
+  await writeFile(metadataFile, JSON.stringify(metadata));
+  for (const expired of [url, id]) rejected(await call('img2img', { ...args, source_image: expired }), /找不到|过期/);
+  rejected(await call('img2img', { ...args, source_image: join(archiveDir, id, 'image.png') }), /禁止读取本地/);
+  assert.deepEqual(api.calls.map(c => c.name), ['generateImage', 'generateImage']);
+});
+
+test('放大前可等比缩小到 1MP；禁止缩小时拒绝超大输入且不调用上游', async t => {
+  const big = await sharp({ create: { width: 1900, height: 900, channels: 3, background: '#123456' } }).png().toBuffer();
+  const api = upstream({ upscaleImage: async () => [outputs.png] });
+  const { call } = await connect(t, { mode: 'paid', client: api.client });
+  const args = { source_image: big.toString('base64') };
+  rejected(await call('upscale_image', { ...args, auto_fit_1mp: false }), /auto_fit_1mp/);
+  success(await call('upscale_image', args));
+  assert.equal(api.calls.length, 1);
+  const { width, height } = await sharp(Buffer.from(api.calls[0].args[0].image, 'base64')).metadata();
+  assert.equal(width % 8, 0);
+  assert.equal(height % 8, 0);
+  assert.ok(width * height <= 1048576);
 });
