@@ -96,7 +96,15 @@ export class VibeCache {
       try {
         const current = await file.stat();
         if (!current.isFile() || current.dev !== info.dev || current.ino !== info.ino || current.size !== info.size) return undefined;
-        entry = JSON.parse(await file.readFile({ encoding: 'utf8', signal: AbortSignal.timeout(FILE_TIMEOUT) }));
+        const bytes = Buffer.allocUnsafe(current.size);
+        const signal = AbortSignal.timeout(FILE_TIMEOUT);
+        for (let offset = 0; offset < bytes.length;) {
+          signal.throwIfAborted();
+          const { bytesRead } = await file.read(bytes, offset, bytes.length - offset, offset);
+          if (!bytesRead) return undefined;
+          offset += bytesRead;
+        }
+        entry = JSON.parse(bytes.toString('utf8'));
       } finally {
         await file.close();
       }
