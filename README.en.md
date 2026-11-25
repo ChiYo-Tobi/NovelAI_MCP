@@ -27,7 +27,9 @@ Image results include **the original image, a 43-character `image_id`, and a sho
 
 ## Client configuration
 
-The examples below use a personal key. Replace `USER_API_KEY` only in your own client; it sends `Authorization: Bearer …` with each MCP request, including reconnects. **For anonymous access omit the entire `headers` field or the CLI authentication flag.** Do not send an empty Bearer header or put keys in URLs, shared configs, screenshots or source control.
+The examples below send `Authorization: Bearer USER_API_KEY` on **each request**. Replace the placeholder only in your own client. **For anonymous access omit the entire `headers` field or the CLI authentication flag.** A malformed `Authorization` header returns HTTP 401; sending the server's reserved default key as a personal key returns HTTP 403. Do not put keys in URLs, shared configs, screenshots or source control.
+
+The MCP endpoint is stateless. POST `initialize`, then POST `notifications/initialized` (empty HTTP 202) and subsequent calls with `MCP-Protocol-Version` set to the negotiated version. Each JSON-RPC request gets its reply on that POST, including when the reply uses SSE framing. The server neither requires nor issues `Mcp-Session-Id`; an old ID is ignored and grants no access. GET and DELETE on **`/mcp/mcp`** return HTTP 405: there is no standalone SSE stream to keep open or session to close. An idle client can send its next request without a heartbeat or a new handshake.
 
 ### Cursor
 
@@ -115,7 +117,7 @@ Anonymous access requires neither the environment variable nor `--bearer-token-e
 codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp
 ```
 
-Reconnect and refresh the tool list after switching modes. Expect 2 tools without credentials and 9 with a personal key.
+After changing the header, refresh `tools/list` to see the tools available to that request. Expect 2 without credentials and 9 with a personal key. Switching modes does not require a new handshake.
 
 ## Self-hosting
 
@@ -135,8 +137,12 @@ Use the supplied [Compose file](docker-compose.yml) and [Dockerfile](Dockerfile)
 | `MCP_DATA_DIR` | Volume `novelai-mcp-data` → `/var/lib/novelai-mcp/data`, for quota and the Vibe cache |
 | `MCP_IMAGE_ARCHIVE_DIR` | Separate volume `novelai-mcp-images` → `/var/lib/novelai-mcp/images`, for temporary images |
 
-The [Caddy route](deploy/caddy-route.caddy) strips the outer `/mcp` **once**: public `/mcp/health` maps to `/health`, and `/mcp/mcp` maps to `/mcp`. Preserve authorization and MCP session headers and disable buffering. A containerized proxy on the same network needs no host port mapping. Before an upgrade, retain the working image tag, drain requests, and back up both volumes and the proxy configuration. Replace the single instance; never let the old and new process write to the same volumes at once. To roll back, keep traffic drained, select the previous image/config and compatible volumes, then check health and the anonymous tool list before reopening traffic. See the [runbook](docs/QUICKSTART-HTTP.md) for the proxy configuration and rollback commands.
+The [Caddy route](deploy/caddy-route.caddy) strips the outer `/mcp` **once**: public `/mcp/health` maps to `/health`, and `/mcp/mcp` maps to `/mcp`. Preserve `Authorization` (including its absence), `MCP-Protocol-Version` and unbuffered POST responses. No sticky routing or GET keepalive is needed. A containerized proxy on the same network needs no host port mapping.
+
+**Run a single instance.** Only the MCP transport is stateless: the free quota ledger and Vibe cache are still stored on disk, and the image archive still enforces its TTL. Before an upgrade, retain the working image tag, drain requests and back up both volumes and the proxy configuration. Never let the old and new process write to the same volumes at once. To roll back, keep traffic drained, select the previous image/config and compatible volumes, then check health and the anonymous tool list before reopening traffic. See the [runbook](docs/QUICKSTART-HTTP.md) for the proxy configuration and rollback commands.
 
 For local development, use Node.js 24 and run `npm ci`, `npm run build`, then `npm test` in the project root. To try the service, use a dedicated `.env` pointing at a reachable test upstream and set `MCP_BIND_HOST=127.0.0.1`. Run `npm run start:http`; the local MCP endpoint is `http://127.0.0.1:3000/mcp`.
+
+To check the **hosted** endpoint without generating images, set `QIANDAI_MCP_API_KEY` to a personal key and run `node scripts/acceptance.mjs --stateless-smoke`. Add `--idle-minutes 31` to wait 31 real minutes and make read-only calls with the same clients, without another handshake. The separate `--live` check consumes free quota and personal credit; do not use it for health checks or automatically retry a timed-out image request.
 
 [Contributing](CONTRIBUTING.md) · [MIT license](LICENSE)

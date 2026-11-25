@@ -115,7 +115,7 @@ codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp --bearer
 codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp
 ```
 
-切换接入方式后重新连接并刷新工具列表，匿名应看到 2 个工具，使用个人密钥应看到 9 个。
+**这个地址是无状态的。** 客户端照常执行 `initialize`，但服务端不签发 `Mcp-Session-Id`，旧客户端发来的 ID 也会被忽略。空闲超过 30 分钟不需要心跳或手动重连。身份只看**当前请求**：个人模式每次都要带 `Authorization`，缺少它的请求按免费模式处理。切换模式后刷新工具列表（匿名 2 项，个人 9 项）；如果客户端缓存了列表，可以重新连接以刷新显示。
 
 ## 自行运行
 
@@ -135,7 +135,7 @@ codex mcp add qiandai-api-mcp --url https://api.chiyotobi.party/mcp/mcp
 | `MCP_DATA_DIR` | 卷 `novelai-mcp-data` → `/var/lib/novelai-mcp/data`，保存额度和 Vibe 缓存 |
 | `MCP_IMAGE_ARCHIVE_DIR` | 独立卷 `novelai-mcp-images` → `/var/lib/novelai-mcp/images`，保存限时图片 |
 
-[现成的 Caddy 片段](deploy/caddy-route.caddy) 只剥掉一次外层 `/mcp`：公网 `/mcp/health` 对应内部 `/health`，`/mcp/mcp` 对应 `/mcp`。保留鉴权头、会话头和流式响应；同网容器反代无需发布宿主端口。升级前先保留旧镜像标签，排空请求后备份两个卷及代理配置，再替换单实例；不要同时用新旧进程写同一个卷。详见[网络、反代和回滚操作](docs/QUICKSTART-HTTP.md)。
+[现成的 Caddy 片段](deploy/caddy-route.caddy) 只剥掉一次外层 `/mcp`：公网 `/mcp/health` 对应内部 `/health`，`/mcp/mcp` 对应 `/mcp`。保留每次请求的鉴权头、协议版本和 POST 流式响应；不需要会话粘滞或 GET 保活。同网容器反代无需发布宿主端口。升级前先保留旧镜像标签，排空请求后备份两个卷及代理配置，再替换单实例；不要同时用新旧进程写同一个卷。详见[网络、反代和回滚操作](docs/QUICKSTART-HTTP.md)。
 
 本地开发使用 Node.js 24：在项目根依次执行 `npm ci`、`npm run build`、`npm test`。本机试运行用专用 `.env` 指向可达的测试上游，并设置 `MCP_BIND_HOST=127.0.0.1`；启动命令为 `npm run start:http`。本机协议地址是 `http://127.0.0.1:3000/mcp`。
 

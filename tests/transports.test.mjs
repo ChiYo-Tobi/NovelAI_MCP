@@ -16,7 +16,9 @@ import { getRuntimeOptions, prepareDirectories } from '../dist/runtime.js';
 // All connections terminate on loopback; never inherit service credentials or call an external upstream.
 const defaultKey = 'test-free-key';
 const personalKey = 'test-paid-key';
+const secondKey = 'test-other-key';
 const rejectedKey = 'test-rejected-key';
+const balances = new Map([[`Bearer ${personalKey}`, 17], [`Bearer ${secondKey}`, 83]]);
 const imageBase = new URL('https://images.example.test/public/prefix');
 const clientInfo = { name: 'transport-test', version: '1' };
 const protocolVersion = '2025-11-25';
@@ -26,20 +28,51 @@ const rpcHeaders = { Accept: 'application/json, text/event-stream', 'Content-Typ
 const freeTools = ['generate_image', 'get_nai_prompt'];
 const paidTools = [...freeTools, 'img2img', 'inpaint_image', 'augment_image', 'upscale_image', 'encode_vibe', 'suggest_tags', 'get_subscription'].sort();
 const entry = fileURLToPath(new URL('../dist/streamable-http-server.js', import.meta.url));
+const testDir = tmpdir();
+const legacyHeaders = { 'Mcp-Session-Id': '99033450-36e6-40e8-94f8-c8fcd7b8bb2b', 'MCP-Protocol-Version': protocolVersion };
+const generation = { name: 'generate_image', arguments: { base_prompt: 'green leaves', width: 64, height: 64, seed: 1 } };
+const promptTool = { name: 'get_nai_prompt', arguments: {} };
+const subscription = { name: 'get_subscription', arguments: {} };
+const callTool = (params, id = 3) => ({ jsonrpc: '2.0', id, method: 'tools/call', params });
+const auth = key => key === undefined ? {} : { Authorization: `Bearer ${key}` };
+const toolNames = result => result.tools.map(tool => tool.name).sort();
 const png = await sharp({ create: { width: 64, height: 64, channels: 3, background: '#2381ae' } }).png().toBuffer();
 
-function fetchLocal(url, options = {}) {
+function assertNoSessionId(response) {
+  assert.equal(response.headers.get('Mcp-Session-Id'), null);
+  assert.doesNotMatch(response.headers.get('Access-Control-Expose-Headers') ?? '', /\bmcp-session-id\b/i);
+}
+async function fetchLocal(url, options = {}) {
   assert.equal(new URL(url).hostname, '127.0.0.1');
-  return fetch(url, { redirect: 'error', signal: AbortSignal.timeout(10_000), ...options });
+  const timeout = AbortSignal.timeout(10_000);
+  const signal = options.signal ? AbortSignal.any([timeout, options.signal]) : timeout;
+  const response = await fetch(url, { ...options, redirect: 'error', signal });
+  assertNoSessionId(response);
+  return response;
 }
 function post(url, body, headers = {}) {
   return fetchLocal(url, { method: 'POST', headers: { ...rpcHeaders, ...headers }, body: JSON.stringify(body) });
 }
-async function rpcResult(response) {
+// A single POST may return JSON or a finite SSE stream. Ignore SSE comments/priming events,
+// but require exactly one JSON-RPC reply on this HTTP request, with that request's id.
+async function postResult(url, body, headers = {}) {
+  const response = await post(url, body, headers);
   assert.equal(response.status, 200);
-  const text = await response.text();
-  const data = text.split(/\r?\n/).find(line => line.startsWith('data:') && line.slice(5).trim());
-  const msg = JSON.parse(data ? data.slice(5) : text);
+  const media = response.headers.get('Content-Type')?.split(';')[0].trim().toLowerCase();
+  let messages;
+  if (media === 'application/json') {
+    messages = [].concat(await response.json());
+  } else {
+    assert.equal(media, 'text/event-stream');
+    messages = (await response.text()).split(/\r?\n\r?\n/)
+      .map(event => event.split(/\r?\n/).filter(line => line.startsWith('data:')).map(line => line.slice(5)).join('\n').trim())
+      .filter(Boolean).map(data => JSON.parse(data));
+  }
+  const replies = messages.filter(msg => 'result' in msg || 'error' in msg);
+  assert.equal(replies.length, 1);
+  const [msg] = replies;
+  assert.equal(msg.jsonrpc, '2.0');
+  assert.equal(msg.id, body.id);
   assert.equal(msg.error, undefined);
   return msg.result;
 }
@@ -50,42 +83,55 @@ async function rpcError(response, status) {
   assert.equal(body.id, null);
   assert.equal(typeof body.error.code, 'number');
   assert.equal(typeof body.error.message, 'string');
-  assert.doesNotMatch(JSON.stringify(body), /test-(?:free|paid|rejected)-key/);
+  assert.doesNotMatch(JSON.stringify(body), /test-(?:free|paid|other|rejected)-key/);
   return body.error;
 }
-async function initSession(url, headers = {}) {
-  const response = await post(url, init, headers);
-  const id = response.headers.get('Mcp-Session-Id');
-  assert.equal((await rpcResult(response)).protocolVersion, protocolVersion);
-  assert.ok(id);
-  return { 'Mcp-Session-Id': id, 'MCP-Protocol-Version': protocolVersion };
+function assertPrompt(result) {
+  assert.notEqual(result.isError, true);
+  assert.equal(result.content[0]?.type, 'text');
+  assert.match(result.content[0].text, /\S/);
+}
+function assertBalance(result, expected) {
+  assert.notEqual(result.isError, true);
+  assert.deepEqual(JSON.parse(result.content[1].text), { balance: expected });
 }
 
 async function fixture(t, { seed, ...overrides } = {}) {
-  const root = await mkdtemp(join(tmpdir(), 'nai-http-'));
+  const root = await mkdtemp(join(testDir, '.nai-http-'));
   const archiveDir = join(root, 'images');
   const dataDir = join(root, 'data');
+  const options = {
+    defaultApiKey: defaultKey, imageOrigin: imageBase, imageTtlMs: 300_000, archiveDir, dataDir,
+    bindHost: '127.0.0.1', port: 0, upstreamBaseUrl: 'http://127.0.0.1:1', ...overrides,
+  };
   let service;
   t.after(async () => {
     try { await service?.close(); } finally { await rm(root, { recursive: true, force: true }); }
   });
   await seed?.(archiveDir, dataDir);
-  service = await startHttpServer({
-    defaultApiKey: defaultKey, imageOrigin: imageBase, imageTtlMs: 300_000, archiveDir, dataDir,
-    bindHost: '127.0.0.1', port: 0, upstreamBaseUrl: 'http://127.0.0.1:1', ...overrides,
-  });
-  const origin = `http://127.0.0.1:${service.server.address().port}`;
-  return { ...service, origin, mcp: new URL('/mcp', origin), archiveDir, dataDir };
+  service = await startHttpServer(options);
+  const port = service.server.address().port;
+  const origin = `http://127.0.0.1:${port}`;
+  async function restart() {
+    await service.close();
+    service = await startHttpServer({ ...options, port });
+    return service;
+  }
+  return { ...service, origin, mcp: new URL('/mcp', origin), archiveDir, dataDir, restart };
 }
 
-async function mockUpstream(t) {
+async function mockUpstream(t, beforeReply) {
   const calls = [];
   const server = createServer(async (req, res) => {
     for await (const _ of req) { /* consume request before replying */ }
-    const auth = req.headers.authorization;
-    calls.push({ route: req.url, auth });
-    if (auth === `Bearer ${rejectedKey}`) return res.writeHead(401).end();
-    if (req.url === '/ai/generate-image') return res.writeHead(200, { 'Content-Type': 'image/png' }).end(png);
+    const call = { method: req.method, route: req.url, auth: req.headers.authorization };
+    calls.push(call);
+    await beforeReply?.(call);
+    if (call.auth === `Bearer ${rejectedKey}`) return res.writeHead(401).end();
+    if (call.method === 'GET' && call.route === '/v1/usage' && balances.has(call.auth)) {
+      return res.writeHead(200, { 'Content-Type': 'application/json' }).end(JSON.stringify({ balance: balances.get(call.auth) }));
+    }
+    if (call.method === 'POST' && call.route === '/ai/generate-image') return res.writeHead(200, { 'Content-Type': 'image/png' }).end(png);
     res.writeHead(404).end();
   });
   server.listen({ host: '127.0.0.1', port: 0 });
@@ -94,22 +140,46 @@ async function mockUpstream(t) {
   return { calls, upstreamBaseUrl: `http://127.0.0.1:${server.address().port}` };
 }
 
-async function sdk(mcp, headers = {}) {
-  const client = new Client(clientInfo);
-  const transport = new StreamableHTTPClientTransport(mcp, { requestInit: { headers } });
-  try { await client.connect(transport, { timeout: 8_000 }); }
-  catch (error) { await client.close(); throw error; }
-  return { client, transport };
+// Hold one upstream response so another request (or shutdown) provably overlaps it, without sleeps.
+function pauseFirstReply() {
+  const entered = Promise.withResolvers();
+  const gate = Promise.withResolvers();
+  let first = true;
+  return {
+    beforeReply() {
+      if (!first) return;
+      first = false;
+      entered.resolve();
+      return gate.promise;
+    },
+    waitFor: pending => Promise.race([entered.promise, pending.then(() => assert.fail('工具未到达 mock 上游'))]),
+    release: gate.resolve,
+  };
 }
 
-test('真实 SDK 握手与 tools/list：仅省略 Authorization 使用免费工具及默认 Key；显式 Key 失败不重试', { timeout: 30_000 }, async t => {
+async function sdk(mcp, headers = {}) {
+  const client = new Client(clientInfo);
+  const posts = [];
+  const transport = new StreamableHTTPClientTransport(mcp, {
+    requestInit: { headers },
+    fetch: (url, options) => {
+      if (options.method === 'POST') posts.push(JSON.parse(options.body).method);
+      return fetchLocal(url, options);
+    },
+  });
+  try { await client.connect(transport, { timeout: 8_000 }); }
+  catch (error) { await client.close(); throw error; }
+  return { client, transport, posts };
+}
+
+test('真实 SDK 握手不发 ID；仅省略 Authorization 使用免费工具及默认 Key，个人 Key 上游失败不重试', { timeout: 30_000 }, async t => {
   const { calls, upstreamBaseUrl } = await mockUpstream(t);
-  const { mcp, origin, dataDir, archiveDir } = await fixture(t, { upstreamBaseUrl });
-  const generation = { name: 'generate_image', arguments: { base_prompt: 'green leaves', width: 64, height: 64, seed: 1 } };
+  const { mcp, origin, dataDir, archiveDir, close } = await fixture(t, { upstreamBaseUrl });
   for (const [key, names] of [[undefined, freeTools], [personalKey, paidTools], [rejectedKey, paidTools]]) {
     const { client, transport } = await sdk(mcp, key ? { Authorization: `bEaReR ${key}` } : {});
     try {
-      assert.deepEqual((await client.listTools()).tools.map(tool => tool.name).sort(), names);
+      assert.equal(transport.sessionId, undefined);
+      assert.deepEqual(toolNames(await client.listTools()), names);
       const result = await client.callTool(generation);
       if (key === rejectedKey) {
         assert.equal(result.isError, true);
@@ -125,58 +195,113 @@ test('真实 SDK 握手与 tools/list：仅省略 Authorization 使用免费工�
         assert.equal(download.status, 200);
         assert.deepEqual(Buffer.from(await download.arrayBuffer()), png);
       }
-      const headers = { 'Mcp-Session-Id': transport.sessionId, ...(key ? { Authorization: `Bearer ${key}` } : {}) };
-      await transport.terminateSession();
-      await rpcError(await post(mcp, list, headers), 404);
+      assert.equal(transport.sessionId, undefined);
     } finally { await client.close(); }
   }
-  assert.deepEqual(calls.map(c => c.auth), [defaultKey, personalKey, rejectedKey].map(key => `Bearer ${key}`));
-  assert.ok(calls.every(c => c.route === '/ai/generate-image'));
+  await close();
+  assert.deepEqual(calls, [defaultKey, personalKey, rejectedKey].map(key => ({
+    method: 'POST', route: '/ai/generate-image', auth: `Bearer ${key}`,
+  })));
   assert.ok((await readdir(dataDir)).includes('free-quota.json'));
   assert.ok(!(await readdir(archiveDir)).includes('free-quota.json'));
 });
 
-// Node's fetch Headers combines duplicate fields: use http.request to exercise true wire duplicates.
-function duplicateAuthorization(url, method, headers, values) {
-  return new Promise((resolve, reject) => {
+test('同一 SDK Client 空闲 31 分钟后不重新 initialize，直接调用不计费工具', { timeout: 15_000 }, async t => {
+  const { calls, upstreamBaseUrl } = await mockUpstream(t);
+  const { mcp } = await fixture(t, { upstreamBaseUrl });
+  const { client, transport, posts } = await sdk(mcp);
+  try {
+    // Move only wall time: real HTTP I/O and request deadlines must keep working.
+    t.mock.timers.enable({ apis: ['Date'], now: Date.now() });
+    t.mock.timers.tick(31 * 60_000);
+    assertPrompt(await client.callTool(promptTool));
+    assert.deepEqual(posts, ['initialize', 'notifications/initialized', 'tools/call']);
+    assert.equal(transport.sessionId, undefined);
+  } finally { await client.close(); }
+  assert.deepEqual(calls, []);
+});
+
+test('相同旧会话 ID 与 JSON-RPC id 的并发请求：个人 Key A/B 只收到自己的用量，匿名仍为免费模式', { timeout: 20_000 }, async t => {
+  const pause = pauseFirstReply();
+  const { calls, upstreamBaseUrl } = await mockUpstream(t, pause.beforeReply);
+  const { mcp, close } = await fixture(t, { upstreamBaseUrl });
+  const send = (body, key) => postResult(mcp, { ...body, id: 7 }, { ...legacyHeaders, ...auth(key) });
+  const usage = callTool(subscription);
+  const first = send(usage, personalKey);
+  try {
+    await pause.waitFor(first);
+    // Complete B and both catalogs while A's upstream response is still held.
+    const [second, denied, free, paid] = await Promise.all([
+      send(usage, secondKey), send(usage), send(list), send(list, secondKey),
+    ]);
+    assertBalance(second, 83);
+    assert.equal(denied.isError, true);
+    assert.deepEqual(toolNames(free), freeTools);
+    assert.deepEqual(toolNames(paid), paidTools);
+  } finally { pause.release(); }
+  assertBalance(await first, 17);
+  const rejected = await send(usage, rejectedKey);
+  assert.equal(rejected.isError, true);
+  assert.match(rejected.content[0].text, /401/);
+  assert.ok(!JSON.stringify(rejected).includes(rejectedKey));
+  await close();
+  assert.deepEqual(calls, [personalKey, secondKey, rejectedKey].map(key => ({
+    method: 'GET', route: '/v1/usage', auth: `Bearer ${key}`,
+  })));
+});
+
+// Fetch Headers combines duplicate fields. Send separate lines, keeping the real response headers.
+async function duplicateAuthorization(url, method, headers, values) {
+  assert.equal(url.hostname, '127.0.0.1');
+  const response = await new Promise((resolve, reject) => {
     const req = request(url, { method, headers: { ...rpcHeaders, ...headers, Authorization: values }, signal: AbortSignal.timeout(5_000) }, res => {
       const chunks = [];
       res.on('data', chunk => chunks.push(chunk));
-      res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode })));
+      res.on('end', () => resolve(new Response(Buffer.concat(chunks), { status: res.statusCode, headers: res.headers })));
       res.on('error', reject);
     });
     req.on('error', reject);
-    req.end(method === 'POST' ? JSON.stringify(headers['Mcp-Session-Id'] ? list : init) : undefined);
+    req.end(method === 'POST' ? JSON.stringify(callTool(generation)) : undefined);
   });
+  assertNoSessionId(response);
+  return response;
 }
-function sessionRequest(mcp, method, headers) {
-  return method === 'POST' ? post(mcp, list, headers) : fetchLocal(mcp, { method, headers: { Accept: 'text/event-stream', ...headers } });
+function nonPost(mcp, method, headers) {
+  return fetchLocal(mcp, { method, headers: { Accept: 'text/event-stream', ...headers } });
 }
 
-test('Authorization 空、错误、合并或重复均拒绝；GET/POST/DELETE 一律校验模式与密钥指纹', { timeout: 30_000 }, async t => {
-  const { mcp } = await fixture(t);
-  const free = await initSession(mcp);
-  const paid = await initSession(mcp, { Authorization: `Bearer ${personalKey}` });
-  await rpcError(await post(mcp, init, { Authorization: `Bearer ${defaultKey}` }), 403);
+test('错误、重复 Authorization 和显式默认 Key 均不降级；GET/DELETE 先鉴权再判断方法', { timeout: 20_000 }, async t => {
+  const { calls, upstreamBaseUrl } = await mockUpstream(t);
+  const { mcp } = await fixture(t, { upstreamBaseUrl });
+  assert.equal((await postResult(mcp, init, { ...legacyHeaders, ...auth(personalKey) })).protocolVersion, protocolVersion);
   for (const value of ['', 'Basic abc', 'Bearer ', 'Bearer abc def', 'Bearer abc, Bearer def', 'Bearer key=inside']) {
-    const error = await rpcError(await post(mcp, init, { Authorization: value }), 401);
-    assert.match(error.message, /Authorization: Bearer <USER_API_KEY>/);
+    const response = await post(mcp, callTool(generation), { ...legacyHeaders, Authorization: value });
+    assert.match(response.headers.get('WWW-Authenticate') ?? '', /^Bearer\b/i);
+    assert.match((await rpcError(response, 401)).message, /Authorization: Bearer <USER_API_KEY>/);
   }
-  await rpcError(await fetchLocal(mcp, { method: 'POST', headers: { ...rpcHeaders, ...paid }, body: '{' }), 403);
-  await rpcError(await duplicateAuthorization(mcp, 'POST', {}, ['Bearer first', 'Bearer second']), 401);
+  await rpcError(await post(mcp, init, auth(defaultKey)), 403);
+  await rpcError(await duplicateAuthorization(mcp, 'POST', {}, [`Bearer ${personalKey}`, `Bearer ${secondKey}`]), 401);
   for (const method of ['GET', 'POST', 'DELETE']) {
-    await rpcError(await sessionRequest(mcp, method, { ...paid, Authorization: '' }), 401);
-    await rpcError(await duplicateAuthorization(mcp, method, paid, [`Bearer ${personalKey}`, `Bearer ${personalKey}`]), 401);
-    for (const headers of [paid, { ...paid, Authorization: 'Bearer other-key' }, { ...free, Authorization: `Bearer ${defaultKey}` }]) {
-      await rpcError(await sessionRequest(mcp, method, headers), 403);
+    const send = headers => method === 'POST' ? post(mcp, callTool(generation), headers) : nonPost(mcp, method, headers);
+    await rpcError(await send({ ...legacyHeaders, Authorization: '' }), 401);
+    await rpcError(await duplicateAuthorization(mcp, method, legacyHeaders, [`Bearer ${personalKey}`, `Bearer ${personalKey}`]), 401);
+    await rpcError(await send({ ...legacyHeaders, ...auth(defaultKey) }), 403);
+  }
+  assert.deepEqual(calls, []);
+});
+
+test('有效身份的 GET/DELETE 均以 405 和 Allow 结束，不留独立事件流，也不影响下次 POST', { timeout: 15_000 }, async t => {
+  const { mcp } = await fixture(t);
+  for (const method of ['GET', 'DELETE']) {
+    for (const headers of [{}, auth(personalKey), legacyHeaders, { ...legacyHeaders, ...auth(personalKey) }]) {
+      const response = await nonPost(mcp, method, headers);
+      assert.equal(response.status, 405);
+      assert.deepEqual((response.headers.get('Allow') ?? '').split(',').map(s => s.trim()).sort(), ['OPTIONS', 'POST']);
+      assert.doesNotMatch(response.headers.get('Content-Type') ?? '', /text\/event-stream/i);
+      await response.arrayBuffer(); // EOF before close(), without aborting a stream.
     }
   }
-  // A rejected DELETE must not revoke someone else's session. The same identity still works.
-  for (const [headers, names] of [[free, freeTools], [{ ...paid, Authorization: `Bearer ${personalKey}` }, paidTools]]) {
-    assert.deepEqual((await rpcResult(await post(mcp, list, headers))).tools.map(tool => tool.name).sort(), names);
-    assert.equal((await sessionRequest(mcp, 'DELETE', headers)).status, 200);
-    await rpcError(await post(mcp, list, headers), 404);
-  }
+  assertPrompt(await postResult(mcp, callTool(promptTool), legacyHeaders));
 });
 
 test('CORS 默认通配、只读健康状态、旧路由全部不可用', async t => {
@@ -186,8 +311,11 @@ test('CORS 默认通配、只读健康状态、旧路由全部不可用', async 
   assert.deepEqual(await res.json(), { status: 'ok' });
   assert.equal(res.headers.get('Access-Control-Allow-Origin'), '*');
   assert.equal(res.headers.get('Access-Control-Allow-Credentials'), null);
-  const session = await initSession(mcp, options.headers);
-  assert.equal((await sessionRequest(mcp, 'DELETE', session)).status, 200);
+  const initialized = await post(mcp, init, options.headers);
+  assert.equal(initialized.status, 200);
+  assert.equal(initialized.headers.get('Access-Control-Allow-Origin'), '*');
+  assert.equal(initialized.headers.get('Access-Control-Allow-Credentials'), null);
+  await initialized.arrayBuffer();
   for (const [method, path] of [['GET', '/sse'], ['POST', '/message'], ['GET', '/admin'], ['POST', '/novelai/not-a-link/mcp'], ['OPTIONS', '/absent']]) {
     assert.equal((await fetchLocal(new URL(path, origin), { method })).status, 404);
   }
@@ -203,8 +331,10 @@ test('显式 CORS allowlist 精确匹配，拒绝未列明的 localhost、图片
   assert.equal(ok.status, 204);
   assert.equal(ok.headers.get('Access-Control-Allow-Origin'), origin);
   assert.match(ok.headers.get('Vary'), /origin/i);
-  assert.match(ok.headers.get('Access-Control-Allow-Headers'), /authorization/i);
-  assert.match(ok.headers.get('Access-Control-Expose-Headers'), /mcp-session-id/i);
+  const allowedHeaders = ok.headers.get('Access-Control-Allow-Headers').toLowerCase().split(',').map(s => s.trim());
+  for (const header of ['authorization', 'mcp-session-id', 'mcp-protocol-version']) assert.ok(allowedHeaders.includes(header));
+  assert.match(ok.headers.get('Access-Control-Expose-Headers') ?? '', /\bmcp-protocol-version\b/i);
+  assert.deepEqual(toolNames(await postResult(mcp, list, { ...legacyHeaders, Origin: origin })), freeTools);
   for (const bad of ['http://localhost', imageBase.origin, origin + '.evil.test', 'null']) {
     await rpcError(await post(mcp, init, { Origin: bad, 'X-Forwarded-Host': 'client.example.test' }), 403);
     const denied = await fetchLocal(mcp, { ...preflight, headers: { ...preflight.headers, Origin: bad } });
@@ -213,22 +343,19 @@ test('显式 CORS allowlist 精确匹配，拒绝未列明的 localhost、图片
   }
 });
 
-test('JSON 解析、50 MiB 请求体限制、SDK 协商与会话错误均可恢复', { timeout: 25_000 }, async t => {
+test('先鉴权再解析 JSON；50 MiB 请求体限制、SDK 内容协商和版本校验后仍可直接调用', { timeout: 25_000 }, async t => {
   const { mcp } = await fixture(t);
-  const syntaxError = await fetchLocal(mcp, { method: 'POST', headers: rpcHeaders, body: '{' });
-  assert.equal((await rpcError(syntaxError, 400)).code, -32700);
-  const badAuth = await fetchLocal(mcp, { method: 'POST', headers: { ...rpcHeaders, Authorization: 'Basic a' }, body: '{' });
-  await rpcError(badAuth, 401);
+  const malformedBody = headers => fetchLocal(mcp, { method: 'POST', headers: { ...rpcHeaders, ...legacyHeaders, ...headers }, body: '{' });
+  for (const headers of [{}, auth(personalKey)]) assert.equal((await rpcError(await malformedBody(headers), 400)).code, -32700);
+  await rpcError(await malformedBody({ Authorization: 'Basic a' }), 401);
+  await rpcError(await malformedBody(auth(defaultKey)), 403);
   const chunk = Buffer.alloc(1024 * 1024, 32);
   const body = (async function* () { for (let i = 0; i < 50; i++) yield chunk; yield ' '; })();
   await rpcError(await fetchLocal(mcp, { method: 'POST', headers: rpcHeaders, duplex: 'half', body }), 413);
-  const badAccept = await post(mcp, init, { Accept: 'application/json' });
-  assert.equal(badAccept.status, 406);
-  assert.equal(badAccept.headers.get('Mcp-Session-Id'), null);
-  await badAccept.arrayBuffer();
-  await rpcError(await post(mcp, list), 400);
-  const session = await initSession(mcp);
-  assert.equal((await rpcResult(await post(mcp, list, session))).tools.length, freeTools.length);
+  await rpcError(await post(mcp, init, { Accept: 'application/json' }), 406);
+  await rpcError(await post(mcp, list, { ...legacyHeaders, 'MCP-Protocol-Version': 'unsupported' }), 400);
+  assert.deepEqual(toolNames(await postResult(mcp, list)), freeTools);
+  assertPrompt(await postResult(mcp, callTool(promptTool), legacyHeaders));
 });
 
 async function archive(dir, char, { age = 0, privateImage = false } = {}) {
@@ -293,7 +420,7 @@ test('运行选项采用新变量，拒绝危险 URL、无效 TTL 和未配置�
 });
 
 test('启动目录同时做 lexical 和 realpath 隔离校验（包含尚未建立的子目录、链接及根目录）', async t => {
-  const root = await mkdtemp(join(tmpdir(), 'nai-paths-'));
+  const root = await mkdtemp(join(testDir, '.nai-paths-'));
   t.after(() => rm(root, { recursive: true, force: true }));
   const data = join(root, 'data');
   await mkdir(data);
@@ -314,19 +441,43 @@ test('启动目录同时做 lexical 和 realpath 隔离校验（包含尚未建�
   await Promise.all([access(result.archiveDir), access(result.dataDir)]);
 });
 
-test('关停同时回收 SDK GET 流、停止监听，重复 close 安全', { timeout: 12_000 }, async t => {
-  const { mcp, close, server } = await fixture(t);
-  const session = await initSession(mcp);
-  const stream = await sessionRequest(mcp, 'GET', session);
-  assert.equal(stream.status, 200);
-  assert.match(stream.headers.get('content-type'), /text\/event-stream/);
-  const end = stream.text();
-  await Promise.all([close(), close(), end]);
+test('重复 close 排空进行中的工具 POST，停止监听，不重放出图', { timeout: 15_000 }, async t => {
+  const pause = pauseFirstReply();
+  const { calls, upstreamBaseUrl } = await mockUpstream(t, pause.beforeReply);
+  const { mcp, close, server } = await fixture(t, { upstreamBaseUrl });
+  const pending = postResult(mcp, callTool(generation), { ...legacyHeaders, Connection: 'close' });
+  let closed;
+  try {
+    await pause.waitFor(pending);
+    closed = Promise.all([close(), close()]);
+  } finally { pause.release(); }
+  const [result] = await Promise.all([pending, closed]);
+  assert.notEqual(result.isError, true);
   assert.equal(server.listening, false);
+  assert.deepEqual(calls, [{ method: 'POST', route: '/ai/generate-image', auth: `Bearer ${defaultKey}` }]);
+});
+
+test('同址独立实例重启清理过期归档；原 SDK Client 直接 call，不重新握手或重放上游', { timeout: 20_000 }, async t => {
+  const { calls, upstreamBaseUrl } = await mockUpstream(t);
+  const { mcp, server, archiveDir, restart } = await fixture(t, { upstreamBaseUrl });
+  // The SDK supplies its own negotiated protocol-version header after initialize.
+  const { client, posts } = await sdk(mcp, { 'Mcp-Session-Id': legacyHeaders['Mcp-Session-Id'], ...auth(personalKey), Connection: 'close' });
+  try {
+    assertBalance(await client.callTool(subscription), 17);
+    const expired = await archive(archiveDir, 'e', { age: 360_000 });
+    const fresh = await restart();
+    assert.notEqual(fresh.server, server);
+    assert.equal(server.listening, false);
+    await assert.rejects(access(join(archiveDir, expired)), { code: 'ENOENT' });
+    assertPrompt(await client.callTool(promptTool));
+    assert.deepEqual(posts, ['initialize', 'notifications/initialized', 'tools/call', 'tools/call']);
+    await fresh.close();
+  } finally { await client.close(); }
+  assert.deepEqual(calls, [{ method: 'GET', route: '/v1/usage', auth: `Bearer ${personalKey}` }]);
 });
 
 test('入口在 SIGTERM 后有序退出且日志不含 Key', { skip: process.platform === 'win32', timeout: 12_000 }, async t => {
-  const root = await mkdtemp(join(tmpdir(), 'nai-signal-'));
+  const root = await mkdtemp(join(testDir, '.nai-signal-'));
   const child = spawn(process.execPath, [entry], { stdio: ['ignore', 'ignore', 'pipe'], env: {
     DEFAULT_NOVELAI_API_KEY: defaultKey, MCP_BIND_HOST: '127.0.0.1', PORT: '0',
     MCP_DATA_DIR: join(root, 'data'), MCP_IMAGE_ARCHIVE_DIR: join(root, 'images'), UPSTREAM_BASE_URL: 'http://127.0.0.1:1',

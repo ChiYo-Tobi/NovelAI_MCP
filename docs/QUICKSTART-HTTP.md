@@ -54,7 +54,7 @@ docker compose exec -T novelai-mcp node -e "const fs=require('node:fs'); if(proc
 
 | 客户端请求 | 反代给 `novelai-mcp:3000` 的路径 |
 |---|---|
-| `https://api.chiyotobi.party/mcp/mcp` | `/mcp`；保留 POST、GET、DELETE 和浏览器 OPTIONS，以及原始鉴权和会话头 |
+| `https://api.chiyotobi.party/mcp/mcp` | `/mcp`；POST 收发 MCP 消息，支持浏览器 OPTIONS 预检。GET、DELETE 返回 405 |
 | `https://api.chiyotobi.party/mcp/novelai-images/{id}.{ext}` | `/novelai-images/{id}.{ext}`；GET/HEAD，不缓存。图片下载不依赖客户端的个人 API Key |
 | `https://api.chiyotobi.party/mcp/health` | `/health`；正常时返回 HTTP 200。容器自己的探针仍直接访问 `/health` |
 
@@ -86,18 +86,28 @@ location ^~ /mcp/ {
 }
 ```
 
-代理与服务端均不要记录 Authorization、请求体、会话 ID 或可用的图片链接。不注入默认密钥；保留默认传递的 `Accept`、`Content-Type`、`Last-Event-ID`、响应里的 `Mcp-Session-Id` 以及 `Cache-Control`。Nginx 用 `nginx -t` 校验，通过后 reload；若它只在启动时解析容器 DNS 名，容器重建后还需 reload 以解析新的 IP。配置生效后用 `curl -fsS https://api.chiyotobi.party/mcp/health` 检查完整前缀转发，预期 HTTP 200、`{"status":"ok"}`。
+代理必须保留每次请求的 `Authorization`（包括缺省）、`MCP-Protocol-Version`、`Accept`、`Content-Type` 和响应的 `Cache-Control`，不要注入默认密钥。旧客户端的 `Mcp-Session-Id` 可以透传；服务端忽略它，不下发新 ID，也不按 ID 路由。不要记录鉴权头、请求体、旧 ID 或有效图片链接。Nginx 用 `nginx -t` 校验，通过后 reload；若它只在启动时解析容器 DNS 名，容器重建后还需 reload 以解析新的 IP。可用 `curl -fsS https://api.chiyotobi.party/mcp/health` 检查完整前缀转发，预期 HTTP 200、`{"status":"ok"}`。
 
-通过代理建立两个独立客户端会话：匿名应列出 2 个工具；带个人密钥应列出 9 个。用 `get_nai_prompt` 验证完整模板即可，不必为探活发起付费图片请求。需做生成验收时，在获准消耗额度后生成一张，在 5 分钟内测试回执的原图、ID 和短链；默认 TTL 过后短链应为 404。
+通过代理 POST `initialize` 协商版本，再以该 `MCP-Protocol-Version` POST `notifications/initialized`（空响应，202）。后续请求都在各自的 POST 上返回结果，不建立独立 GET 流，不发保活。用 `tools/list` 验证不带鉴权列出 2 个工具、带个人密钥列出 9 个；权限只取决于本次请求，而非上一次握手。
+
+**公网只读验收**：在运行脚本的环境中设置个人 `QIANDAI_MCP_API_KEY`（不是服务端默认密钥），从仓库根目录选择以下一条命令。两者都验证工具列表、完整模板及个人 `get_subscription`，不发起任何图片操作。
+
+```sh
+node scripts/acceptance.mjs --stateless-smoke
+# 也可真实静置 31 分钟，让原客户端不保活、不重新握手，再做只读调用：
+node scripts/acceptance.mjs --stateless-smoke --idle-minutes 31
+```
+
+**收费验收**另用 `node scripts/acceptance.mjs --live`，仅在明确获准消耗额度时运行。它会执行 1 次免费生成和 4 次个人密钥图片操作，校验原图、ID、短链和默认 300 秒 TTL 到期后的 404。不要把它用作探活，也不要自动重试计费请求。
 
 ## 4. 平滑切换与回滚
 
-这是**单实例、有状态**服务。平滑切换靠排空请求和客户端重连，不是让两个版本同时读写同一账本。
+**MCP 传输无状态，运维仍限单实例**：免费额度账本、Vibe 缓存和限时图片都在卷中。切换版本前要排空正在处理的 POST，不能让两个版本同时读写同一账本。
 
 1. **变更前**：记录当前镜像 ID、唯一镜像标签、端口、卷名、网络名及反代配置，安全保存专用 `.env`。在候选版本的独立网络、卷、端口和模拟上游中先验收；不要把第二个别名 `novelai-mcp` 加进生产网。保留足够磁盘空间和已验证的旧镜像。
 2. **切换时**：先在反代暂停接收新调用，等在途生成和预占/回滚结束，勿自动重放请求。用 `docker compose stop novelai-mcp` 正常停止，再对**同一时间点的两个卷**做受限备份/快照（保留文件属主、权限及时间），记录与镜像的对应关系。不要删除卷或重置额度。
-3. **发布**：将 `MCP_IMAGE_TAG` 切至已验证的唯一标签，对应镜像已在本机时执行 `docker compose up -d --no-build --wait novelai-mcp`；必要时更新反代并验证配置。先查内部 `/health`、卷写权限、模板和两种工具清单，再放行流量。重启前的 MCP 会话需重新初始化。
-4. **回滚**：暂停新流量并排空、停止候选容器，将 `MCP_IMAGE_TAG` 与 Compose、反代配置恢复到已知健康版本，保留原有网络和卷。若数据格式向后兼容，优先复用现有卷以保留最新用量；若不兼容，先保全当前卷，确认变更后的业务记录如何对账，再离线恢复匹配的两个备份。**不能通过回滚旧账本丢弃已经成功的生成记录**。再次执行 `docker compose up -d --no-build --wait novelai-mcp`，按上述验收并让客户端重连后再放量。
+3. **发布**：将 `MCP_IMAGE_TAG` 切至已验证的唯一标签，对应镜像已在本机时执行 `docker compose up -d --no-build --wait novelai-mcp`；必要时更新反代并验证配置。先查内部 `/health`、卷写权限、模板和两种工具清单，再放行流量。无状态版本没有待恢复的 MCP 会话；仍支持原协商版本时，客户端可直接发送下一个 POST。
+4. **回滚**：暂停新流量并排空、停止候选容器，将 `MCP_IMAGE_TAG` 与 Compose、反代配置恢复到已知健康版本，保留原有网络和卷。若数据格式向后兼容，优先复用现有卷以保留最新用量；若不兼容，先保全当前卷，确认变更后的业务记录如何对账，再离线恢复匹配的两个备份。**不能通过回滚旧账本丢弃已经成功的生成记录**。再次执行 `docker compose up -d --no-build --wait novelai-mcp`，按回滚目标版本验收工具调用后再放量；若回到旧的有会话版本，客户端按该版本的握手流程接入。
 
 切勿用 `docker compose down -v`、卷清理或跳过鉴权来排错。图像备份本身仍是敏感数据，应限制访问并按保留策略销毁；5 分钟的在线访问期限不是备份的保留授权。
 
@@ -105,5 +115,5 @@ location ^~ /mcp/ {
 
 - **网络不存在 / 上游不通**：核对 external network 名是否完全匹配、上游的网络别名和内部端口是否正确。容器内的 `localhost` 不是宿主或上游。
 - **公网 404 但 `/health` 正常**：先区分 MCP 入口与图片短链；核对路径是否只去掉一层 `/mcp`，图片是否过期、扩展名是否与回执一致。不要把 `MCP_IMAGE_PUBLIC_BASE_URL` 写成 `…/mcp/mcp`。
-- **付费客户端只看到 2 个工具**：确认每次请求都转发 Authorization；切换密钥或模式后新建会话，而非复用旧会话 ID。客户端应区分 Origin 拒绝、会话过期、个人密钥被上游拒绝和匿名额度用尽。
+- **个人客户端只看到 2 个工具**：检查 `tools/list` 这次请求是否带了 `Authorization: Bearer USER_API_KEY`，代理是否原样转发；更换凭据后刷新工具列表，不用换 ID。缺省头走匿名，格式不正确返回 401；把服务端保留密钥当作个人密钥发送返回 403。Origin 拒绝也可能返回 403。上游拒绝个人密钥不会回退到免费额度。
 - **图片请求超时**：检查代理缓冲、请求体大小、读取超时及客户端超时。先核对上游是否已成功，避免自动重试产生第二次费用。

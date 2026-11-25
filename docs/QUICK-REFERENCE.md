@@ -1,6 +1,8 @@
 # 工具和图片速查
 
-接入地址是 `https://api.chiyotobi.party/mcp/mcp`，传输方式为 Streamable HTTP。每次请求均不带 `Authorization` 是匿名模式；每次请求均带 `Authorization: Bearer USER_API_KEY` 是个人密钥模式。换密钥或模式后新建会话。具体参数以该会话的 `tools/list` schema 为准。
+接入地址是 `https://api.chiyotobi.party/mcp/mcp`，传输方式为无状态 Streamable HTTP。**每次请求独立鉴权**：省略 `Authorization` 是匿名模式；`Authorization: Bearer USER_API_KEY` 是个人模式。头格式错误返回 401，把服务端保留密钥作为个人密钥发送返回 403。切换模式后重新调用 `tools/list` 看当前可用工具及参数，不用重新握手。
+
+初始化后，带协商的 `MCP-Protocol-Version` 用 POST 发送 `notifications/initialized`（202），后续工具请求也在各自的 POST 上收取响应。服务不下发也不要求 `Mcp-Session-Id`，旧 ID 会被忽略，不能继承权限。闲置期间不必保活；协议端点不提供独立 SSE 流或会话终止操作（GET、DELETE 返回 405）。这不影响用 GET 下载有效期内的图片。
 
 | 工具 | 匿名 | 个人 | 输入 / 返回 |
 |---|:---:|:---:|---|
